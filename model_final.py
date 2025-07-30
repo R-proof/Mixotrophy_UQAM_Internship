@@ -253,8 +253,28 @@ def create_shap_plots(model, X, y, response_name, dataset_name, figures_dir):
         'Importance': importance
     }).sort_values('Importance', ascending=False)
     
-    # Utiliser TOUTES les variables, pas seulement les 9 premières
-    top_predictors = importance_df['Variable'].tolist()
+    # Regrouper les variables dummy de lake_id et traiter comme une seule variable
+    if dataset_name == 'ELA':
+        # Identifier les variables dummy de lake_id
+        lake_vars = [var for var in importance_df['Variable'] if var.startswith('lake_')]
+        non_lake_vars = [var for var in importance_df['Variable'] if not var.startswith('lake_')]
+        
+        if lake_vars:
+            # Calculer l'importance cumulée des variables lake_id
+            lake_importance = importance_df[importance_df['Variable'].isin(lake_vars)]['Importance'].sum()
+            
+            # Créer la liste des prédicteurs finaux
+            # Ajouter 'lake_id' avec son importance cumulée
+            lake_entry = pd.DataFrame({'Variable': ['lake_id'], 'Importance': [lake_importance]})
+            non_lake_df = importance_df[importance_df['Variable'].isin(non_lake_vars)]
+            
+            # Combiner et retrier
+            combined_df = pd.concat([lake_entry, non_lake_df]).sort_values('Importance', ascending=False)
+            top_predictors = combined_df['Variable'].tolist()
+        else:
+            top_predictors = importance_df['Variable'].tolist()
+    else:
+        top_predictors = importance_df['Variable'].tolist()
     
     # Configuration du graphique : grille flexible selon le nombre de variables
     n_vars = len(top_predictors)
@@ -281,32 +301,52 @@ def create_shap_plots(model, X, y, response_name, dataset_name, figures_dir):
         else:
             ax = axes[row, col]
         
-        temp_df = shap_df[shap_df['Variable'] == var]
+        color = metric_colors.get(response_name, '#1f77b4')
         
-        if len(temp_df) > 0:
-            color = metric_colors.get(response_name, '#1f77b4')
+        # Traitement spécial pour lake_id groupé
+        if var == 'lake_id' and dataset_name == 'ELA':
+            # Récupérer toutes les variables dummy de lake_id
+            lake_vars = [col_name for col_name in X_sample.columns if col_name.startswith('lake_')]
             
-            # Traitement spécial pour les prédicteurs catégoriels
-            if ((var == 'lake_id' and dataset_name == 'ELA') or 
-                (var.startswith('lake_') and dataset_name == 'ELA')):
-                # Boxplot pour les variables catégorielles (lake_id et variables dummy)
-                unique_values = sorted(temp_df['Valeur'].unique())
-                box_data = [temp_df[temp_df['Valeur'] == val]['SHAP'].values 
-                           for val in unique_values if len(temp_df[temp_df['Valeur'] == val]) > 0]
+            if lake_vars:
+                # Extraire le numéro de lac de chaque variable dummy
+                lake_data = []
+                lake_labels = []
                 
-                bp = ax.boxplot(box_data, positions=range(len(unique_values)),
-                               patch_artist=True)
-                for patch in bp['boxes']:
-                    patch.set_facecolor(color)
-                    patch.set_alpha(0.7)
+                for lake_var in lake_vars:
+                    # Extraire le numéro de lac (ex: 'lake_114' -> '114')
+                    lake_num = lake_var.split('_')[1]
+                    
+                    # Obtenir les données SHAP pour cette variable dummy
+                    lake_temp_df = shap_df[shap_df['Variable'] == lake_var]
+                    
+                    # Ajouter les valeurs SHAP quand cette variable dummy = 1
+                    lake_shap_values = lake_temp_df[lake_temp_df['Valeur'] == 1]['SHAP'].values
+                    if len(lake_shap_values) > 0:
+                        lake_data.append(lake_shap_values)
+                        lake_labels.append(lake_num)
                 
-                ax.set_xticks(range(len(unique_values)))
-                # Pour les variables dummy, afficher les valeurs (0, 1)
-                if var.startswith('lake_'):
-                    ax.set_xticklabels([f'{int(val)}' for val in unique_values])
-                else:
-                    ax.set_xticklabels(unique_values)
-            else:
+                # Créer les boxplots pour tous les lacs
+                if lake_data:
+                    bp = ax.boxplot(lake_data, positions=range(len(lake_data)),
+                                   patch_artist=True)
+                    for patch in bp['boxes']:
+                        patch.set_facecolor(color)
+                        patch.set_alpha(0.7)
+                    
+                    ax.set_xticks(range(len(lake_labels)))
+                    ax.set_xticklabels(lake_labels)
+                    
+                    # Pour les variables catégorielles, aligner automatiquement sur zéro
+                    y_min, y_max = ax.get_ylim()
+                    y_abs_max = max(abs(y_min), abs(y_max))
+                    ax.set_ylim(-y_abs_max, y_abs_max)
+        
+        else:
+            # Traitement normal pour les autres variables (continues)
+            temp_df = shap_df[shap_df['Variable'] == var]
+            
+            if len(temp_df) > 0:
                 # Scatter plot avec ligne de tendance pour les variables continues
                 ax.scatter(temp_df['Valeur'], temp_df['SHAP'], 
                           alpha=0.3, s=3, color=color)
@@ -319,18 +359,7 @@ def create_shap_plots(model, X, y, response_name, dataset_name, figures_dir):
                         ax.plot(trend[:, 0], trend[:, 1], color=color, linewidth=2)
                     except:
                         pass
-            
-            # Configuration des axes
-            ax.set_xlabel(get_variable_display_name(var), fontsize=14)
-            if col == 0:  # Première colonne
-                ax.set_ylabel('SHAP Value', fontsize=14)
-            
-            # Ligne de zéro
-            ax.axhline(0, color='grey', linestyle='--', alpha=0.5)
-            
-            # Calculer automatiquement les limites SHAP pour voir toutes les courbes
-            if not ((var == 'lake_id' and dataset_name == 'ELA') or 
-                    (var.startswith('lake_') and dataset_name == 'ELA')):
+                
                 # Pour les variables continues, calculer les limites basées sur les données et courbes de tendance
                 trend_line = None
                 if len(temp_df) > 10:
@@ -342,18 +371,21 @@ def create_shap_plots(model, X, y, response_name, dataset_name, figures_dir):
                 
                 shap_limits_auto = get_shap_limits_from_data(temp_df, trend_line)
                 ax.set_ylim(shap_limits_auto[0], shap_limits_auto[1])
-            else:
-                # Pour les variables catégorielles, aligner automatiquement sur zéro
-                y_min, y_max = ax.get_ylim()
-                y_abs_max = max(abs(y_min), abs(y_max))
-                ax.set_ylim(-y_abs_max, y_abs_max)
-            
-            # Ajout de la lettre pour identifier le subplot (si assez de lettres)
-            if i < len(letters):
-                ax.text(0.02, 0.98, letters[i], transform=ax.transAxes, 
-                       fontsize=14, fontweight='bold', verticalalignment='top')
-            
-            ax.tick_params(axis='both', labelsize=12)
+        
+        # Configuration des axes (commune à tous les types)
+        ax.set_xlabel(get_variable_display_name(var), fontsize=14)
+        if col == 0:  # Première colonne
+            ax.set_ylabel('SHAP Value', fontsize=14)
+        
+        # Ligne de zéro
+        ax.axhline(0, color='grey', linestyle='--', alpha=0.5)
+        
+        # Ajout de la lettre pour identifier le subplot (si assez de lettres)
+        if i < len(letters):
+            ax.text(0.02, 0.98, letters[i], transform=ax.transAxes, 
+                   fontsize=14, fontweight='bold', verticalalignment='top')
+        
+        ax.tick_params(axis='both', labelsize=12)
     
     # Masquer les subplots vides
     for i in range(n_vars, n_rows * n_cols):
@@ -923,6 +955,212 @@ def create_combined_shap_rank_plot(shap_results_all):
     return f"{combined_figures_dir}/SHAP_rank_combined.png"
 
 ###############################################################################
+# Analyse des interactions prédicteurs-prévalence
+###############################################################################
+
+def get_metric_display_name(metric):
+    """Retourner le nom d'affichage pour les métriques"""
+    mapping = {
+        'rich_genus_no_cyano': 'Richesse (S)',
+        'shannon_no_cyano': 'Shannon (H\')',
+        'eveness_piel_no_cyano': 'Équitabilité (J\')'
+    }
+    return mapping.get(metric, metric)
+
+def analyze_predictor_prevalence_interaction(shap_values_dict, X_dict, dataset_name, figures_dir):
+    """Analyser l'interaction des prédicteurs avec la prévalence en mixotrophie selon la décomposition SHAP"""
+    print(f"Analyse de l'interaction prédicteurs-prévalence pour {dataset_name}")
+    
+    # Configuration des couleurs pour les métriques
+    metric_colors = {
+        'rich_genus_no_cyano': '#E69F00',    # Orange pour richesse
+        'shannon_no_cyano': '#56B4E9',       # Bleu pour Shannon
+        'eveness_piel_no_cyano': '#009E73'   # Vert pour équitabilité
+    }
+    
+    # Obtenir les prédicteurs principaux (excluant prev_Mixo)
+    all_predictors = set()
+    for response, shap_vals in shap_values_dict.items():
+        # Calculer l'importance moyenne absolue pour chaque prédicteur
+        importance = np.abs(shap_vals.values).mean(axis=0)
+        feature_importance = dict(zip(shap_vals.feature_names, importance))
+        
+        # Garder seulement les top prédicteurs (excluant prev_Mixo)
+        sorted_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)
+        top_features = [feat[0] for feat in sorted_features[:12] if feat[0] != 'prev_Mixo']
+        all_predictors.update(top_features)
+    
+    # Filtrer et regrouper les variables dummy de lake_id pour ELA
+    if dataset_name == 'ELA':
+        lake_vars = [var for var in all_predictors if var.startswith('lake_')]
+        other_vars = [var for var in all_predictors if not var.startswith('lake_')]
+        if lake_vars:
+            other_vars.append('lake_id')  # Regrouper toutes les variables dummy
+        final_predictors = other_vars[:10]  # Limiter à 10 prédicteurs
+    else:
+        final_predictors = list(all_predictors)[:10]  # Limiter à 10 prédicteurs
+    
+    # Calculer les interactions avec prev_Mixo selon la décomposition SHAP
+    interaction_data = []
+    
+    for response, shap_vals in shap_values_dict.items():
+        X_sample = X_dict[response]
+        
+        # Trouver l'index de prev_Mixo
+        try:
+            prev_mixo_idx = shap_vals.feature_names.index('prev_Mixo')
+        except ValueError:
+            print(f"prev_Mixo non trouvé dans {response} pour {dataset_name}")
+            continue
+        
+        # Valeurs SHAP pour prev_Mixo (φ_mixo^(i))
+        prev_mixo_shap = shap_vals.values[:, prev_mixo_idx]
+        
+        # Calculer l'effet total de prev_Mixo
+        total_prev_mixo_effect = np.abs(prev_mixo_shap).sum()
+        
+        for predictor in final_predictors:
+            if predictor == 'lake_id' and dataset_name == 'ELA':
+                # Gérer les variables dummy de lake_id
+                lake_vars = [var for var in shap_vals.feature_names if var.startswith('lake_')]
+                if lake_vars:
+                    # Sommer les effets de toutes les variables dummy
+                    predictor_shap = np.zeros(len(shap_vals.values))
+                    for lake_var in lake_vars:
+                        lake_idx = shap_vals.feature_names.index(lake_var)
+                        predictor_shap += shap_vals.values[:, lake_idx]
+                else:
+                    continue
+            else:
+                try:
+                    pred_idx = shap_vals.feature_names.index(predictor)
+                    predictor_shap = shap_vals.values[:, pred_idx]
+                except ValueError:
+                    continue
+            
+            # Calculer l'interaction selon la décomposition SHAP: φ_j^(i) = φ_jj^(i) + Σ φ_jk^(i)
+            # Approximation: interaction basée sur la covariance entre les effets SHAP
+            if len(predictor_shap) > 0 and len(prev_mixo_shap) > 0:
+                # Calculer la covariance entre les effets SHAP du prédicteur et de prev_Mixo
+                cov_matrix = np.cov(predictor_shap, prev_mixo_shap)
+                covariance = cov_matrix[0, 1] if not np.isnan(cov_matrix[0, 1]) else 0
+                
+                # Variance de prev_Mixo
+                var_prev_mixo = np.var(prev_mixo_shap)
+                
+                # Pourcentage d'interaction (effet conjoint relatif)
+                if var_prev_mixo > 0:
+                    # Normaliser par l'effet total de prev_Mixo pour obtenir un pourcentage
+                    interaction_effect = abs(covariance) / var_prev_mixo
+                    interaction_percentage = min(interaction_effect * 100, 15)  # Crop à 15%
+                else:
+                    interaction_percentage = 0
+                
+                interaction_data.append({
+                    'Predictor': predictor,
+                    'Metric': response,
+                    'Interaction_Percentage': interaction_percentage,
+                    'Covariance': covariance
+                })
+    
+    # Créer le DataFrame
+    df_interactions = pd.DataFrame(interaction_data)
+    
+    if len(df_interactions) == 0:
+        print(f"Aucune donnée d'interaction trouvée pour {dataset_name}")
+        return None
+    
+    return df_interactions
+
+def create_combined_prevalence_interaction_plot(ela_interactions, lpnla_interactions):
+    """Créer la figure combinée des interactions prédicteurs-prévalence (LPNLA à gauche, ELA à droite)"""
+    
+    # Configuration des couleurs pour les métriques
+    metric_colors = {
+        'rich_genus_no_cyano': '#E69F00',    # Orange pour richesse
+        'shannon_no_cyano': '#56B4E9',       # Bleu pour Shannon
+        'eveness_piel_no_cyano': '#009E73'   # Vert pour équitabilité
+    }
+    
+    # Créer la figure avec deux sous-graphiques côte à côte
+    fig, (ax_lpnla, ax_ela) = plt.subplots(1, 2, figsize=(20, 8))
+    
+    # Fonction pour créer un graphique pour un dataset
+    def plot_dataset(ax, df_interactions, dataset_name):
+        if df_interactions is None or len(df_interactions) == 0:
+            ax.text(0.5, 0.5, f'Aucune donnée\npour {dataset_name}', 
+                   ha='center', va='center', transform=ax.transAxes, fontsize=14)
+            ax.set_title(dataset_name, fontsize=16, fontweight='bold')
+            return
+        
+        predictors = df_interactions['Predictor'].unique()
+        metrics = ['rich_genus_no_cyano', 'shannon_no_cyano', 'eveness_piel_no_cyano']
+        
+        # Position des barres
+        x_positions = np.arange(len(predictors))
+        bar_width = 0.25
+        
+        # Créer les barres pour chaque métrique
+        for i, metric in enumerate(metrics):
+            metric_data = df_interactions[df_interactions['Metric'] == metric]
+            
+            values = []
+            for predictor in predictors:
+                pred_data = metric_data[metric_data['Predictor'] == predictor]
+                if len(pred_data) > 0:
+                    values.append(pred_data['Interaction_Percentage'].iloc[0])
+                else:
+                    values.append(0)
+            
+            # Créer les barres avec opacité faible pour l'effet marginal restant
+            positions = x_positions + i * bar_width
+            
+            # Barres principales (effet d'interaction)
+            bars = ax.bar(positions, values, bar_width, 
+                         label=get_metric_display_name(metric),
+                         color=metric_colors[metric], alpha=0.8)
+            
+            # Barres d'effet marginal restant (jusqu'à 15% - crop)
+            remaining_values = [15 - v for v in values]
+            ax.bar(positions, remaining_values, bar_width, 
+                   bottom=values, color=metric_colors[metric], alpha=0.1)
+        
+        # Configuration des axes
+        ax.set_ylabel('% of total effect on diversity', fontsize=14)
+        ax.set_title(dataset_name, fontsize=16, fontweight='bold')
+        
+        # Limiter l'axe Y à 15% pour une belle visualisation
+        ax.set_ylim(0, 15)
+        
+        # Configuration de l'axe X
+        ax.set_xticks(x_positions + bar_width)
+        ax.set_xticklabels([get_variable_display_name(pred) for pred in predictors], 
+                           rotation=45, ha='right')
+        
+        # Grille
+        ax.grid(True, alpha=0.3, axis='y')
+    
+    # Créer les graphiques pour chaque dataset
+    plot_dataset(ax_lpnla, lpnla_interactions, 'LPNLA')
+    plot_dataset(ax_ela, ela_interactions, 'ELA')
+    
+    # Légende commune
+    if ela_interactions is not None and len(ela_interactions) > 0:
+        ax_ela.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    elif lpnla_interactions is not None and len(lpnla_interactions) > 0:
+        ax_lpnla.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    plt.tight_layout()
+    
+    # Sauvegarder dans le dossier FIGURES principal
+    output_path = "/Users/renaudsrr/Desktop/STAGE_MTL/MODELISATION/NEW_ALL/FIGURES/predictor_prevalence_interaction_combined.png"
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Figure d'interaction combinée sauvegardée : {output_path}")
+    return output_path
+
+###############################################################################
 # Fonctions d'analyse des résidus
 ###############################################################################
 
@@ -1282,6 +1520,47 @@ def main():
     # Créer le graphique de ranking SHAP combiné
     if shap_results_all:
         create_combined_shap_rank_plot(shap_results_all)
+    
+    # Analyser les interactions prédicteurs-prévalence
+    print("\\n" + "="*50)
+    print("ANALYSE DES INTERACTIONS PRÉDICTEURS-PRÉVALENCE")
+    print("="*50)
+    
+    ela_interactions = None
+    lpnla_interactions = None
+    
+    # Analyser les interactions pour chaque dataset
+    for dataset_name in ['ELA', 'LPNLA']:
+        if dataset_name in shap_results_all and shap_results_all[dataset_name]:
+            print(f"\\nTraitement du dataset: {dataset_name}")
+            
+            # Collecter les données X pour ce dataset en utilisant les données globales
+            dataset_X = {}
+            for response in responses:
+                key = f"{dataset_name}_{response}"
+                if key in all_results[dataset_name]['shap_values']:
+                    # Utiliser les données X correspondantes depuis les résultats
+                    if dataset_name in all_results and 'models' in all_results[dataset_name]:
+                        # Récupérer les données depuis la source appropriée
+                        if dataset_name == 'ELA':
+                            dataset_X[response] = X_ela_sampled if 'X_ela_sampled' in locals() else None
+                        else:
+                            dataset_X[response] = X_lpnla_sampled if 'X_lpnla_sampled' in locals() else None
+            
+            # Créer l'analyse d'interaction
+            interactions = analyze_predictor_prevalence_interaction(
+                shap_results_all[dataset_name], dataset_X, dataset_name, 
+                os.path.join("/Users/renaudsrr/Desktop/STAGE_MTL/MODELISATION/NEW_ALL/FIGURES", f"{dataset_name}_model")
+            )
+            
+            if dataset_name == 'ELA':
+                ela_interactions = interactions
+            else:
+                lpnla_interactions = interactions
+    
+    # Créer la figure combinée
+    if ela_interactions is not None or lpnla_interactions is not None:
+        create_combined_prevalence_interaction_plot(ela_interactions, lpnla_interactions)
     
     # Créer le tableau des métriques SHAP
     create_shap_metrics_table(shap_results_all, metrics_all, "")
