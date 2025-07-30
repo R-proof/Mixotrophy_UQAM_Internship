@@ -1,18 +1,25 @@
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-from sklearn.model_selection import KFold, train_test_split
+from sklearn.model_selection import KFold, cross_val_score, train_test_split
 from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.preprocessing import StandardScaler
 import shap
 import matplotlib.pyplot as plt
 import seaborn as sns
+from matplotlib.patches import Patch
 from statsmodels.nonparametric.smoothers_lowess import lowess
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing as mp
 import time
+from mpl_toolkits.mplot3d import Axes3D
+from scipy.interpolate import griddata
+from scipy.stats import gaussian_kde
 from scipy import stats
 import os
 import argparse
+from statsmodels.tsa.stattools import acf, pacf
+from statsmodels.tsa.stattools import adfuller, kpss
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -20,19 +27,19 @@ warnings.filterwarnings('ignore')
 # Configuration et paramètres
 ###############################################################################
 
-# Configuration des datasets
+# Configuration des datasets (SANS LAGS)
 DATASETS = {
     'ELA': {
-        'path': "/Users/renaudsrr/Desktop/STAGE_MTL/MODELISATION/NEW_ALL/DATA_MODEL/ELA_py.csv",
+        'path': "/Users/renaudsrr/Desktop/STAGE_MTL/MODELISATION/NEW_ALL/DATA_RAW/df_final/ELA_py.csv",
         'covariable': ["year", "doy", "COND_uS.cm",
                        "Chla_ug.L", "TNTP_mg.L", "pH_mean",
-                       "DO_up", "DO_bottom", "prev_Cyano", "prev_Mixo", "lake_id"],
+                       "DO_up", "DO_bottom", "prev_Cyano", "prev_Mixo", "lake_id"],  # DO_up et DO_bottom rajoutés
         'validation_type': 'leave_one_year_out',
         'figures_dir': "/Users/renaudsrr/Desktop/STAGE_MTL/MODELISATION/NEW_ALL/FIGURES/ELA_model",
         'output_prefix': 'ELA'
     },
     'LPNLA': {
-        'path': "/Users/renaudsrr/Desktop/STAGE_MTL/MODELISATION/NEW_ALL/DATA_MODEL/LP_NLA_py.csv",
+        'path': "/Users/renaudsrr/Desktop/STAGE_MTL/MODELISATION/NEW_ALL/DATA_RAW/df_final/LP_NLA_py.csv",
         'covariable': ["lat", "long", "area_m2", "COND_uS.cm",
                        "Chla_ug.L", "TNTP_mg.L", "pH_mean",
                        "DO_up", "DO_bottom", "Biom_Cladocera_ugL", "Biom_Copepoda_ugL",
@@ -50,422 +57,36 @@ responses = ['rich_genus_no_cyano', 'shannon_no_cyano', 'eveness_piel_no_cyano']
 # Fonctions utilitaires
 ###############################################################################
 
-def load_data(dataset_name):
-    """Charge les données pour un dataset donné."""
-    config = DATASETS[dataset_name]
-    data = pd.read_csv(config['path'])
-    
-    # Nettoyage des données
-    X = data[config['covariable']].copy()
-    y_dict = {}
-    
-    for response in responses:
-        y_dict[response] = data[response].copy()
-        
-        # Élimination des valeurs aberrantes (au-delà de 3 écarts-types)
-        mean_val = y_dict[response].mean()
-        std_val = y_dict[response].std()
-        outlier_mask = np.abs(y_dict[response] - mean_val) > 3 * std_val
-        
-        X = X[~outlier_mask]
-        for resp in y_dict:
-            y_dict[resp] = y_dict[resp][~outlier_mask]
-    
-    return X, y_dict
-
-def train_xgboost_model(X, y, response_name, validation_type='kfold'):
-    """Entraîne un modèle XGBoost avec validation croisée."""
-    
-    # Configuration des paramètres selon la variable de réponse
-    if response_name == 'rich_genus_no_cyano':
-        params = {
-            'objective': 'reg:tweedie',
-            'tweedie_variance_power': 1.5,
-            'max_depth': 6,
-            'learning_rate': 0.1,
-            'n_estimators': 100,
-            'subsample': 0.8,
-            'colsample_bytree': 0.8,
-            'random_state': 42
-        }
-    else:
-        params = {
-            'objective': 'reg:squarederror',
-            'max_depth': 6,
-            'learning_rate': 0.1,
-            'n_estimators': 100,
-            'subsample': 0.8,
-            'colsample_bytree': 0.8,
-            'random_state': 42
-        }
-    
-    model = xgb.XGBRegressor(**params)
-    
-    if validation_type == 'leave_one_year_out':
-        # Pour ELA : validation leave-one-year-out
-        years = X['year'].unique()
-        scores = []
-        
-        for year in years:
-            test_mask = X['year'] == year
-            train_mask = ~test_mask
-            
-            X_train, X_test = X[train_mask], X[test_mask]
-            y_train, y_test = y[train_mask], y[test_mask]
-            
-            # Enlever la variable 'year' pour l'entraînement
-            X_train_no_year = X_train.drop('year', axis=1)
-            X_test_no_year = X_test.drop('year', axis=1)
-            
-            model.fit(X_train_no_year, y_train)
-            y_pred = model.predict(X_test_no_year)
-            score = r2_score(y_test, y_pred)
-            scores.append(score)
-        
-        # Entraînement final sur toutes les données
-        X_final = X.drop('year', axis=1)
-        model.fit(X_final, y)
-        
-    else:
-        # Pour LPNLA : validation croisée k-fold
-        kf = KFold(n_splits=5, shuffle=True, random_state=42)
-        scores = []
-        
-        for train_idx, test_idx in kf.split(X):
-            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-            
-            model.fit(X_train, y_train)
-            y_pred = model.predict(X_test)
-            score = r2_score(y_test, y_pred)
-            scores.append(score)
-        
-        # Entraînement final sur toutes les données
-        model.fit(X, y)
-    
-    return model, np.mean(scores), np.std(scores)
-
-def calculate_shap_values(model, X, dataset_name):
-    """Calcule les valeurs SHAP pour un modèle donné."""
-    
-    # Préparation des données selon le dataset
-    if dataset_name == 'ELA' and 'year' in X.columns:
-        X_shap = X.drop('year', axis=1)
-    else:
-        X_shap = X.copy()
-    
-    # Calcul des valeurs SHAP
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_shap)
-    
-    return shap_values, X_shap
-
-def create_shap_plots(shap_values, X_shap, response_name, dataset_name, figures_dir):
-    """Crée les graphiques SHAP pour une variable de réponse."""
-    
-    # Assurer que le répertoire existe
-    os.makedirs(figures_dir, exist_ok=True)
-    
-    # 1. Summary plot
-    plt.figure(figsize=(10, 8))
-    shap.summary_plot(shap_values, X_shap, show=False)
-    plt.tight_layout()
-    plt.savefig(f"{figures_dir}/{dataset_name}_{response_name}_shap_summary.png", 
-                dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # 2. Bar plot (importance)
-    plt.figure(figsize=(8, 6))
-    shap.summary_plot(shap_values, X_shap, plot_type="bar", show=False)
-    plt.tight_layout()
-    plt.savefig(f"{figures_dir}/{dataset_name}_{response_name}_shap_importance.png", 
-                dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # 3. Dependence plots pour les variables les plus importantes
-    feature_importance = np.abs(shap_values).mean(0)
-    top_features = np.argsort(feature_importance)[-5:]  # Top 5 features
-    
-    for i, feature_idx in enumerate(top_features):
-        feature_name = X_shap.columns[feature_idx]
-        plt.figure(figsize=(8, 6))
-        shap.dependence_plot(feature_idx, shap_values, X_shap, show=False)
-        plt.title(f'SHAP Dependence Plot - {feature_name}')
-        plt.tight_layout()
-        plt.savefig(f"{figures_dir}/{dataset_name}_{response_name}_dependence_{feature_name}.png", 
-                    dpi=300, bbox_inches='tight')
-        plt.close()
-
-def create_combined_shap_plots(datasets_results, figures_base_dir):
-    """Crée les graphiques SHAP combinés pour tous les datasets et variables."""
-    
-    # Assurer que le répertoire existe
-    os.makedirs(figures_base_dir, exist_ok=True)
-    
-    # 1. Graphique d'importance combiné
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    fig.suptitle('SHAP Feature Importance - Tous Datasets et Variables', fontsize=16)
-    
-    for i, response in enumerate(responses):
-        for j, dataset in enumerate(['ELA', 'LPNLA']):
-            ax = axes[j, i]
-            
-            if dataset in datasets_results and response in datasets_results[dataset]:
-                shap_values = datasets_results[dataset][response]['shap_values']
-                X_shap = datasets_results[dataset][response]['X_shap']
-                
-                feature_importance = np.abs(shap_values).mean(0)
-                sorted_idx = np.argsort(feature_importance)
-                
-                ax.barh(range(len(feature_importance)), feature_importance[sorted_idx])
-                ax.set_yticks(range(len(feature_importance)))
-                ax.set_yticklabels([X_shap.columns[i] for i in sorted_idx])
-                ax.set_title(f'{dataset} - {response}')
-                ax.set_xlabel('Mean |SHAP value|')
-            else:
-                ax.text(0.5, 0.5, 'Données non disponibles', 
-                       ha='center', va='center', transform=ax.transAxes)
-                ax.set_title(f'{dataset} - {response}')
-    
-    plt.tight_layout()
-    plt.savefig(f"{figures_base_dir}/combined_shap_importance.png", 
-                dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # 2. Heatmap des interactions SHAP
-    for dataset in ['ELA', 'LPNLA']:
-        if dataset in datasets_results:
-            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-            fig.suptitle(f'SHAP Interaction Heatmaps - {dataset}', fontsize=16)
-            
-            for i, response in enumerate(responses):
-                ax = axes[i]
-                
-                if response in datasets_results[dataset]:
-                    shap_values = datasets_results[dataset][response]['shap_values']
-                    X_shap = datasets_results[dataset][response]['X_shap']
-                    
-                    # Calculer la matrice d'interaction
-                    feature_importance = np.abs(shap_values).mean(0)
-                    top_features_idx = np.argsort(feature_importance)[-8:]  # Top 8 features
-                    
-                    interaction_matrix = np.zeros((len(top_features_idx), len(top_features_idx)))
-                    
-                    for j, feat1_idx in enumerate(top_features_idx):
-                        for k, feat2_idx in enumerate(top_features_idx):
-                            if j != k:
-                                # Corrélation entre les valeurs SHAP des deux features
-                                corr = np.corrcoef(shap_values[:, feat1_idx], 
-                                                 shap_values[:, feat2_idx])[0, 1]
-                                interaction_matrix[j, k] = corr
-                    
-                    top_feature_names = [X_shap.columns[idx] for idx in top_features_idx]
-                    
-                    im = ax.imshow(interaction_matrix, cmap='RdBu_r', vmin=-1, vmax=1)
-                    ax.set_xticks(range(len(top_feature_names)))
-                    ax.set_yticks(range(len(top_feature_names)))
-                    ax.set_xticklabels(top_feature_names, rotation=45, ha='right')
-                    ax.set_yticklabels(top_feature_names)
-                    ax.set_title(f'{response}')
-                    
-                    # Ajouter les valeurs dans les cellules
-                    for j in range(len(top_feature_names)):
-                        for k in range(len(top_feature_names)):
-                            text = ax.text(k, j, f'{interaction_matrix[j, k]:.2f}',
-                                         ha="center", va="center", color="black", fontsize=8)
-                else:
-                    ax.text(0.5, 0.5, 'Données non disponibles', 
-                           ha='center', va='center', transform=ax.transAxes)
-                    ax.set_title(f'{response}')
-            
-            plt.tight_layout()
-            plt.savefig(f"{figures_base_dir}/{dataset}_shap_interactions.png", 
-                        dpi=300, bbox_inches='tight')
-            plt.close()
-
-def generate_latex_tables(datasets_results, figures_base_dir):
-    """Génère les tableaux LaTeX avec les métriques et valeurs SHAP."""
-    
-    # Tableau des métriques de performance
-    metrics_table = "\\begin{table}[htbp]\n\\centering\n"
-    metrics_table += "\\begin{tabular}{|l|l|c|c|}\n\\hline\n"
-    metrics_table += "Dataset & Variable & R² moyen & Écart-type \\\\\n\\hline\n"
-    
-    for dataset in ['ELA', 'LPNLA']:
-        if dataset in datasets_results:
-            for response in responses:
-                if response in datasets_results[dataset]:
-                    r2_mean = datasets_results[dataset][response]['r2_mean']
-                    r2_std = datasets_results[dataset][response]['r2_std']
-                    metrics_table += f"{dataset} & {response} & {r2_mean:.3f} & {r2_std:.3f} \\\\\n"
-    
-    metrics_table += "\\hline\n\\end{tabular}\n"
-    metrics_table += "\\caption{Métriques de performance des modèles XGBoost}\n"
-    metrics_table += "\\label{tab:model_performance}\n\\end{table}\n"
-    
-    # Sauvegarder le tableau des métriques
-    with open(f"{figures_base_dir}/model_performance_table.tex", 'w') as f:
-        f.write(metrics_table)
-    
-    # Tableau des importances SHAP
-    shap_table = "\\begin{table}[htbp]\n\\centering\n"
-    shap_table += "\\begin{tabular}{|l|l|l|c|}\n\\hline\n"
-    shap_table += "Dataset & Variable & Feature & Importance SHAP \\\\\n\\hline\n"
-    
-    for dataset in ['ELA', 'LPNLA']:
-        if dataset in datasets_results:
-            for response in responses:
-                if response in datasets_results[dataset]:
-                    shap_values = datasets_results[dataset][response]['shap_values']
-                    X_shap = datasets_results[dataset][response]['X_shap']
-                    
-                    feature_importance = np.abs(shap_values).mean(0)
-                    sorted_idx = np.argsort(feature_importance)[::-1]  # Ordre décroissant
-                    
-                    # Top 5 features pour chaque combinaison
-                    for i in range(min(5, len(sorted_idx))):
-                        feature_name = X_shap.columns[sorted_idx[i]]
-                        importance = feature_importance[sorted_idx[i]]
-                        shap_table += f"{dataset} & {response} & {feature_name} & {importance:.4f} \\\\\n"
-    
-    shap_table += "\\hline\n\\end{tabular}\n"
-    shap_table += "\\caption{Top 5 des importances SHAP par dataset et variable}\n"
-    shap_table += "\\label{tab:shap_importance}\n\\end{table}\n"
-    
-    # Sauvegarder le tableau SHAP
-    with open(f"{figures_base_dir}/shap_importance_table.tex", 'w') as f:
-        f.write(shap_table)
-    
-    print(f"Tableaux LaTeX sauvegardés dans {figures_base_dir}/")
-
-def process_single_combination(args):
-    """Traite une seule combinaison dataset/response (pour parallélisation)."""
-    dataset_name, response_name = args
-    
-    print(f"Traitement: {dataset_name} - {response_name}")
-    
-    # Chargement des données
-    X, y_dict = load_data(dataset_name)
-    y = y_dict[response_name]
-    
-    # Entraînement du modèle
-    config = DATASETS[dataset_name]
-    model, r2_mean, r2_std = train_xgboost_model(X, y, response_name, config['validation_type'])
-    
-    # Calcul des valeurs SHAP
-    shap_values, X_shap = calculate_shap_values(model, X, dataset_name)
-    
-    # Création des graphiques SHAP individuels
-    create_shap_plots(shap_values, X_shap, response_name, dataset_name, config['figures_dir'])
-    
-    print(f"Terminé: {dataset_name} - {response_name} (R² = {r2_mean:.3f} ± {r2_std:.3f})")
-    
-    return {
-        'dataset': dataset_name,
-        'response': response_name,
-        'model': model,
-        'r2_mean': r2_mean,
-        'r2_std': r2_std,
-        'shap_values': shap_values,
-        'X_shap': X_shap
+def get_variable_display_name(var_name):
+    """Retourner le nom d'affichage correct pour une variable selon l'image fournie"""
+    variable_mapping = {
+        # Variables communes
+        'year': 'Year',
+        'doy': 'Doy',
+        'lake_id': 'Lake ID',
+        'COND_uS.cm': 'COND',
+        'Chla_ug.L': 'Chla',
+        'TNTP_mg.L': 'TNTP',
+        'pH_mean': 'pH mean',
+        'DO_up': 'DO up',
+        'DO_bottom': 'DO bottom',
+        'prev_Cyano': 'Prev Cyano',
+        'prev_Mixo': 'Prev Mixo',
+        # Variables ELA spécifiques
+        # Variables LPNLA spécifiques
+        'lat': 'Lat',
+        'long': 'Long',
+        'area_m2': 'Area',
+        'Biom_Cladocera_ugL': 'Biom Cladocera',
+        'Biom_Copepoda_ugL': 'Biom Copepoda',
+        'color': 'Color',
+        'temp_up': 'Temp up',
+        'temp_bottom': 'Temp bottom',
+        'wind_30d': 'Wind 30d',
+        'tp_30d': 'TP 30d',
+        'degree_day_thr0': 'Degree day thr0'
     }
-
-def run_analysis(dataset_filter=None):
-    """Lance l'analyse complète avec parallélisation."""
-    
-    print("Début de l'analyse SHAP unifiée")
-    start_time = time.time()
-    
-    # Préparation des combinaisons à traiter
-    combinations = []
-    datasets_to_process = [dataset_filter] if dataset_filter else ['ELA', 'LPNLA']
-    
-    for dataset_name in datasets_to_process:
-        if dataset_name in DATASETS:
-            for response_name in responses:
-                combinations.append((dataset_name, response_name))
-    
-    print(f"Traitement de {len(combinations)} combinaisons dataset/variable")
-    
-    # Traitement parallèle
-    if len(combinations) > 1:
-        n_cores = min(mp.cpu_count() - 1, 8)
-        print(f"Utilisation de {n_cores} cœurs pour le traitement parallèle")
-        
-        with ProcessPoolExecutor(max_workers=n_cores) as executor:
-            results = list(executor.map(process_single_combination, combinations))
-    else:
-        # Traitement séquentiel pour un seul élément
-        results = [process_single_combination(combinations[0])]
-    
-    # Organisation des résultats
-    datasets_results = {}
-    for result in results:
-        dataset = result['dataset']
-        response = result['response']
-        
-        if dataset not in datasets_results:
-            datasets_results[dataset] = {}
-        
-        datasets_results[dataset][response] = {
-            'model': result['model'],
-            'r2_mean': result['r2_mean'],
-            'r2_std': result['r2_std'],
-            'shap_values': result['shap_values'],
-            'X_shap': result['X_shap']
-        }
-    
-    print(f"Traitement parallèle terminé en {time.time() - start_time:.2f} secondes")
-    
-    # Génération des graphiques combinés et tableaux LaTeX
-    figures_base_dir = "/Users/renaudsrr/Desktop/STAGE_MTL/MODELISATION/NEW_ALL/FIGURES"
-    
-    print("Génération des graphiques combinés...")
-    create_combined_shap_plots(datasets_results, figures_base_dir)
-    
-    print("Génération des tableaux LaTeX...")
-    generate_latex_tables(datasets_results, figures_base_dir)
-    
-    print(f"Analyse {dataset_filter or 'complète'} terminée en {time.time() - start_time:.2f} secondes au total")
-    
-    return datasets_results
-
-###############################################################################
-# Point d'entrée principal
-###############################################################################
-
-def main():
-    """Point d'entrée principal avec arguments en ligne de commande."""
-    
-    parser = argparse.ArgumentParser(description='Analyse SHAP unifiée pour les datasets ELA et LP-NLA')
-    parser.add_argument('--dataset', choices=['ELA', 'LPNLA'], 
-                       help='Dataset spécifique à traiter (optionnel)')
-    parser.add_argument('--figures-only', action='store_true',
-                       help='Générer seulement les figures combinées (nécessite des données pré-calculées)')
-    
-    args = parser.parse_args()
-    
-    print("="*80)
-    print("ANALYSE SHAP UNIFIÉE - MODÈLES XGBOOST")
-    print("="*80)
-    
-    global_start_time = time.time()
-    
-    if not args.figures_only:
-        # Analyse complète
-        results = run_analysis(args.dataset)
-        print(f"\nAnalyse terminée avec succès en {time.time() - global_start_time:.2f} secondes")
-        print(f"Figures sauvegardées dans les répertoires respectifs")
-        print(f"Graphiques combinés et tableaux dans /Users/renaudsrr/Desktop/STAGE_MTL/MODELISATION/NEW_ALL/FIGURES/")
-    else:
-        print("Mode figures seulement - non implémenté pour cette version")
-
-if __name__ == "__main__":
-    main()
-
-###############################################################################
-# Fonctions utilitaires
-###############################################################################
+    return variable_mapping.get(var_name, var_name)
 
 def load_data(dataset_name):
     """Charger les données pour un dataset spécifique (variables lag supprimées)"""
@@ -474,8 +95,6 @@ def load_data(dataset_name):
     print(f"Données {dataset_name} chargées: {len(df)} observations, {len(dataset_config['covariable'])} covariables")
     
     # Variables lag supprimées selon les demandes de simplification
-    # df_with_lags, lag_vars = add_lagged_response_variables(df, dataset_name)
-    
     # Récupérer la liste des covariables (sans lag)
     updated_covariables = dataset_config['covariable']
     print(f"Covariables finales: {len(updated_covariables)} variables (sans lag)")
@@ -486,12 +105,12 @@ def create_directories(dataset_name):
     """Créer les répertoires de sortie"""
     dataset_config = DATASETS[dataset_name]
     figures_dir = dataset_config['figures_dir']
-    tables_dir = figures_dir.replace('/figures_model/', '/figures_model/tables/')
+    data_model_dir = "/Users/renaudsrr/Desktop/STAGE_MTL/MODELISATION/NEW_ALL/DATA_MODEL"
     
     os.makedirs(figures_dir, exist_ok=True)
-    os.makedirs(tables_dir, exist_ok=True)
+    os.makedirs(data_model_dir, exist_ok=True)
     
-    return figures_dir, tables_dir
+    return figures_dir
 
 def get_xgb_params(response_name):
     """Retourner les paramètres XGBoost appropriés selon la métrique"""
@@ -499,8 +118,8 @@ def get_xgb_params(response_name):
         # Paramètres optimisés pour Tweedie (richesse)
         return {
             'objective': 'reg:tweedie',
-            'tweedie_variance_power': 1.2,  # Optimal pour les données de richesse
-            'n_estimators': 100,  # Augmenté pour Tweedie
+            'tweedie_variance_power': 1.2,
+            'n_estimators': 100,
             'learning_rate': 0.05,
             'max_depth': 6,
             'min_child_weight': 1,
@@ -513,15 +132,15 @@ def get_xgb_params(response_name):
             'n_jobs': 2
         }
     else:
-        # Paramètres pour Shannon et Équitabilité (MSE)
+        # Paramètres pour Shannon et Evenness (régression standard)
         return {
             'objective': 'reg:squarederror',
-            'n_estimators': 50,
-            'learning_rate': 0.05,
-            'max_depth': 6,
+            'n_estimators': 80,
+            'learning_rate': 0.1,
+            'max_depth': 5,
             'min_child_weight': 1,
-            'subsample': 0.8,
-            'colsample_bytree': 0.8,
+            'subsample': 0.85,
+            'colsample_bytree': 0.85,
             'gamma': 0,
             'reg_alpha': 0,
             'reg_lambda': 1,
@@ -530,349 +149,438 @@ def get_xgb_params(response_name):
         }
 
 ###############################################################################
-# Fonctions de traitement parallèle
+# Fonctions de modélisation
 ###############################################################################
 
-def process_response_year_ela(args):
-    """Fonction pour traiter une combinaison réponse-année en parallèle (ELA)"""
-    resp, test_year, df_data, covariable = args
+def train_and_validate_model(X, y, dataset_name, response_name):
+    """Entraîner et valider un modèle XGBoost"""
     
-    # Séparer les données d'entraînement/validation (85%) du test final (15%)
-    train_val_df = df_data[df_data['year'] != test_year]
-    test_df = df_data[df_data['year'] == test_year]
+    params = get_xgb_params(response_name)
     
-    # Supprimer les lignes avec des valeurs manquantes dans les covariables
-    train_val_df = train_val_df.dropna(subset=covariable)
-    test_df = test_df.dropna(subset=covariable)
-    
-    # Vérifier qu'il reste assez de données
-    if len(train_val_df) < 10 or len(test_df) < 1:
-        print(f"Pas assez de données pour {resp}, année {test_year} après suppression des NaN")
-        return [], [], {'mae': np.nan, 'r2': np.nan, 'test_year': test_year, 'n_test': 0}
-    
-    X_train_val = train_val_df[covariable].copy()
-    y_train_val = train_val_df[resp]
-    X_test = test_df[covariable].copy()
-    y_test = test_df[resp]
-    
-    # Convertir la richesse en entiers pour la distribution de Poisson
-    if resp == 'rich_genus_no_cyano':
-        y_train_val = np.round(y_train_val).astype(int)
-        y_test = np.round(y_test).astype(int)
-    
-    # Encoder les variables catégorielles
-    if 'lake_id' in X_train_val.columns:
-        # Encoder lake_id en numérique
-        lake_mapping = {lake: i for i, lake in enumerate(sorted(df_data['lake_id'].unique()))}
-        X_train_val['lake_id'] = X_train_val['lake_id'].map(lake_mapping)
-        X_test['lake_id'] = X_test['lake_id'].map(lake_mapping)
-    
-    # Modèle optimisé avec paramètres appropriés selon la métrique
-    model = xgb.XGBRegressor(**get_xgb_params(resp))
-    model.fit(X_train_val, y_train_val)
-    
-    # Prédictions pour calculer les métriques
-    y_pred_train_val = model.predict(X_train_val)
-    y_pred_test = model.predict(X_test)
-    
-    # Optimisation SHAP : échantillonnage stratifié pour garantir tous les lacs
-    sample_size = min(500, len(X_train_val))
-    
-    # Échantillonnage stratifié par lac pour ELA (garantir tous les lacs)
-    if 'lake_id' in X_train_val.columns:
-        unique_lakes = X_train_val['lake_id'].unique()
-        samples_per_lake = max(1, sample_size // len(unique_lakes))
+    if dataset_name == 'ELA' and 'lake_id' in X.columns:
+        # Validation Leave-One-Year-Out pour ELA
+        unique_years = sorted(X['year'].unique())
+        mae_scores = []
+        r2_scores = []
         
-        sample_indices = []
-        for lake in unique_lakes:
-            lake_indices = X_train_val[X_train_val['lake_id'] == lake].index
-            n_samples = min(samples_per_lake, len(lake_indices))
-            lake_sample = np.random.choice(lake_indices, n_samples, replace=False)
-            sample_indices.extend(lake_sample)
-        
-        # Compléter jusqu'à sample_size si nécessaire
-        remaining_size = sample_size - len(sample_indices)
-        if remaining_size > 0:
-            remaining_indices = X_train_val.index.difference(sample_indices)
-            if len(remaining_indices) > 0:
-                additional_samples = np.random.choice(remaining_indices, 
-                                                    min(remaining_size, len(remaining_indices)), 
-                                                    replace=False)
-                sample_indices.extend(additional_samples)
-        
-        sample_idx = sample_indices[:sample_size]
-        X_train_val_sample = X_train_val.loc[sample_idx]
-        
-        # Récupérer les valeurs originales (non encodées) pour les variables catégorielles
-        X_train_val_sample_original = train_val_df[covariable].loc[sample_idx]
-    else:
-        # Échantillonnage simple pour les autres cas
-        sample_idx = np.random.choice(len(X_train_val), sample_size, replace=False)
-        X_train_val_sample = X_train_val.iloc[sample_idx]
-        
-        # Récupérer les valeurs originales (non encodées) pour les variables catégorielles
-        X_train_val_sample_original = train_val_df[covariable].iloc[sample_idx]
-    
-    explainer = shap.Explainer(model, X_train_val_sample)
-    shap_values = explainer(X_train_val_sample)
-    
-    # Création des données SHAP avec les valeurs originales pour les variables catégorielles
-    shap_data = []
-    for i, col in enumerate(X_train_val_sample.columns):
-        for j in range(len(X_train_val_sample)):
-            # Utiliser les valeurs originales pour les variables catégorielles
-            if col in ['lake_id']:
-                value = X_train_val_sample_original[col].iloc[j]
-            else:
-                value = X_train_val_sample[col].iloc[j]
+        for test_year in unique_years:
+            X_train = X[X['year'] != test_year]
+            X_test = X[X['year'] == test_year]
+            y_train = y[X['year'] != test_year]
+            y_test = y[X['year'] == test_year]
             
-            shap_data.append({
-                'Valeur': value,
-                'SHAP': shap_values.values[j, i],
-                'Variable': col,
-                'Année': test_year,
-                'Métrique': resp
-            })
-    
-    # Calcul des ranks
-    mean_abs_shap = np.abs(shap_values.values).mean(axis=0)
-    ranks = mean_abs_shap.argsort()[::-1]
-    rank_data = []
-    for i, idx in enumerate(ranks):
-        rank_data.append({
-            'Predictor': X_train_val_sample.columns[idx],
-            'Rank': i + 1,
-            'Response': resp
-        })
-    
-    # Calculer MAE et R² pour cette année de test
-    mae_test = mean_absolute_error(y_test, y_pred_test)
-    r2_test = r2_score(y_test, y_pred_test)
-    
-    metrics = {
-        'mae': mae_test,
-        'r2': r2_test,
-        'test_year': test_year,
-        'n_test': len(y_test)
-    }
-    
-    return shap_data, rank_data, metrics
-
-def process_response_fold_lpnla(args):
-    """Fonction pour traiter une combinaison réponse-fold en parallèle (LP-NLA)"""
-    resp, fold_idx, train_idx, val_idx, df_data, covariable = args
-    
-    # Données d'entraînement et validation
-    X_train = df_data[covariable].iloc[train_idx].copy()
-    y_train = df_data[resp].iloc[train_idx]
-    X_val = df_data[covariable].iloc[val_idx].copy()
-    y_val = df_data[resp].iloc[val_idx]
-    
-    # Convertir la richesse en entiers pour la distribution de Poisson
-    if resp == 'rich_genus_no_cyano':
-        y_train = np.round(y_train).astype(int)
-        y_val = np.round(y_val).astype(int)
-    
-    # Modèle optimisé avec paramètres appropriés selon la métrique
-    model = xgb.XGBRegressor(**get_xgb_params(resp))
-    model.fit(X_train, y_train)
-    
-    # Prédictions pour calculer les métriques
-    y_pred_train = model.predict(X_train)
-    y_pred_val = model.predict(X_val)
-    
-    # Optimisation SHAP : échantillonnage pour réduire le calcul
-    sample_size = min(500, len(X_train))
-    sample_idx = np.random.choice(len(X_train), sample_size, replace=False)
-    X_train_sample = X_train.iloc[sample_idx]
-    
-    explainer = shap.Explainer(model, X_train_sample)
-    shap_values = explainer(X_train_sample)
-    
-    # Création des données SHAP
-    shap_data = []
-    for i, col in enumerate(X_train_sample.columns):
-        for j in range(len(X_train_sample)):
-            value = X_train_sample[col].iloc[j]
+            if len(X_test) == 0:
+                continue
+                
+            # Supprimer lake_id pour l'entraînement
+            X_train_clean = X_train.drop(['lake_id'], axis=1)
+            X_test_clean = X_test.drop(['lake_id'], axis=1)
             
-            shap_data.append({
-                'Valeur': value,
-                'SHAP': shap_values.values[j, i],
-                'Variable': col,
-                'Fold': fold_idx,
-                'Métrique': resp
-            })
-    
-    # Calcul des ranks
-    mean_abs_shap = np.abs(shap_values.values).mean(axis=0)
-    ranks = mean_abs_shap.argsort()[::-1]
-    rank_data = []
-    for i, idx in enumerate(ranks):
-        rank_data.append({
-            'Predictor': X_train_sample.columns[idx],
-            'Rank': i + 1,
-            'Response': resp
-        })
-    
-    # Calculer MAE et R² pour ce fold
-    mae_val = mean_absolute_error(y_val, y_pred_val)
-    r2_val = r2_score(y_val, y_pred_val)
-    
-    metrics = {
-        'mae': mae_val,
-        'r2': r2_val,
-        'fold': fold_idx,
-        'n_val': len(y_val)
-    }
-    
-    return shap_data, rank_data, metrics
-
-###############################################################################
-# Fonctions de visualisation
-###############################################################################
-
-def get_axis_limits(data, percentile_lower=5, percentile_upper=95):
-    """Calculer les limites d'axes basées sur les percentiles pour éviter les outliers"""
-    if len(data) == 0:
-        return None, None
-    
-    # Nettoyer les données (enlever NaN et infinis)
-    clean_data = data.dropna()
-    clean_data = clean_data[np.isfinite(clean_data)]
-    
-    if len(clean_data) == 0:
-        return None, None
-    
-    lower_bound = np.percentile(clean_data, percentile_lower)
-    upper_bound = np.percentile(clean_data, percentile_upper)
-    
-    # Vérifier que les bornes sont finies
-    if not (np.isfinite(lower_bound) and np.isfinite(upper_bound)):
-        return None, None
-    
-    # Ajouter une marge plus importante de 15% pour éviter le crop
-    range_data = upper_bound - lower_bound
-    if range_data > 0:
-        margin = range_data * 0.15  # Augmenté de 10% à 15%
-        return lower_bound - margin, upper_bound + margin
+            model = xgb.XGBRegressor(**params)
+            model.fit(X_train_clean, y_train)
+            
+            y_pred = model.predict(X_test_clean)
+            
+            mae_scores.append(mean_absolute_error(y_test, y_pred))
+            r2_scores.append(r2_score(y_test, y_pred))
+        
+        mae_mean = np.mean(mae_scores)
+        r2_mean = np.mean(r2_scores)
+        
+        # Entraîner le modèle final sur toutes les données
+        X_final = X.drop(['lake_id'], axis=1)
+        final_model = xgb.XGBRegressor(**params)
+        final_model.fit(X_final, y)
+        
     else:
-        return lower_bound - 1.5, upper_bound + 1.5  # Augmenté de 1 à 1.5
+        # Validation K-Fold pour LPNLA
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        model = xgb.XGBRegressor(**params)
+        model.fit(X_train, y_train)
+        
+        y_pred = model.predict(X_test)
+        mae_mean = mean_absolute_error(y_test, y_pred)
+        r2_mean = r2_score(y_test, y_pred)
+        
+        final_model = model
+        X_final = X
+    
+    return final_model, X_final, mae_mean, r2_mean
 
-def create_combined_shap_plot(shap_dfs, responses, covariable, figures_dir, dataset_name):
-    """Créer la figure SHAP combinée pour toutes les métriques avec deux axes des ordonnées"""
-    print(f"Génération de la figure SHAP combinée pour {dataset_name}")
+###############################################################################
+# Fonctions de visualisation SHAP
+###############################################################################
+
+def create_shap_plots(model, X, y, response_name, dataset_name, figures_dir):
+    """Créer les graphiques SHAP en style PDP (Partial Dependence Plot)"""
     
-    # Mapper les noms de prédicteurs pour l'affichage
-    predictor_mapping = {
-        'year': 'Year',
-        'doy': 'Doy', 
-        'lat': 'Lat',
-        'long': 'Long',
-        'area_m2': 'Area',
-        'COND_uS.cm': 'COND',
-        'Chla_ug.L': 'Chla',
-        'TNTP_mg.L': 'TNTP',
-        'pH_mean': 'pH mean',
-        'DO_up': 'DO up',
-        'DO_bottom': 'DO bottom',
-        'Biom_Cladocera_ugL': 'Biom Cladocera',
-        'Biom_Copepoda_ugL': 'Biom Copepoda',
-        'color': 'Color',
-        'temp_up': 'Temp up',
-        'temp_bottom': 'Temp bottom',
-        'wind_30d': 'Wind 30d',
-        'tp_30d': 'TP 30d',
-        'degree_day_thr0': 'Degree day > 0',
-        'prev_Cyano': 'Prev Cyano',
-        'prev_Mixo': 'Prev Mixo',
-        'lake_id': 'Lake ID'
-        # Variables lag supprimées selon les demandes de simplification
-    }
+    # Calculer les valeurs SHAP avec échantillonnage
+    sample_size = min(2000, len(X))
+    if len(X) > sample_size:
+        sample_idx = np.random.choice(len(X), sample_size, replace=False)
+        X_sample = X.iloc[sample_idx]
+    else:
+        X_sample = X
     
-    shap_all_df = pd.concat(shap_dfs, axis=0)
+    explainer = shap.Explainer(model, X_sample)
+    shap_values = explainer(X_sample)
     
-    # Calculer l'importance moyenne absolue pour chaque prédicteur
-    importance_by_var = shap_all_df.groupby('Variable')['SHAP'].apply(lambda x: np.abs(x).mean()).sort_values(ascending=False)
-    
-    # Sélectionner les 9 prédicteurs les plus importants (ordre décroissant d'importance)
-    top_predictors = importance_by_var.head(9).index.tolist()
-    print(f"Top 9 prédicteurs pour {dataset_name} (ordre décroissant d'importance): {top_predictors}")
-    
-    # Filtrer les données pour ne garder que les top 9 prédicteurs
-    shap_all_df = shap_all_df[shap_all_df['Variable'].isin(top_predictors)]
-    shap_all_df['Variable'] = pd.Categorical(shap_all_df['Variable'], categories=top_predictors, ordered=True)
-    shap_all_df = shap_all_df.sort_values('Variable')
-    
-    # Définir les couleurs fixes pour chaque métrique (colorblind-friendly)
+    # Configuration des couleurs pour les métriques
     metric_colors = {
         'rich_genus_no_cyano': '#E69F00',    # Orange
         'shannon_no_cyano': '#56B4E9',       # Bleu ciel
         'eveness_piel_no_cyano': '#009E73'   # Vert bleu
     }
     
-    # Configuration uniforme : 3x3 pour les 9 prédicteurs les plus importants
-    n_vars = 9  # Fixé à 9 prédicteurs
-    n_cols = 3  # 3 colonnes pour avoir une grille 3x3
-    fig_size = (18, 15)  # Taille augmentée pour un meilleur rendu
+    # Création des données SHAP
+    shap_data = []
+    for i, col in enumerate(X_sample.columns):
+        for j in range(len(X_sample)):
+            shap_data.append({
+                'Valeur': X_sample[col].iloc[j],
+                'SHAP': shap_values.values[j, i],
+                'Variable': col,
+                'Métrique': response_name
+            })
     
-    n_rows = 3  # 3 lignes pour avoir une grille 3x3
+    shap_df = pd.DataFrame(shap_data)
+    
+    # Obtenir l'ordre d'importance des variables
+    importance = np.abs(shap_values.values).mean(0)
+    importance_df = pd.DataFrame({
+        'Variable': X_sample.columns,
+        'Importance': importance
+    }).sort_values('Importance', ascending=False)
+    
+    # Utiliser TOUTES les variables, pas seulement les 9 premières
+    top_predictors = importance_df['Variable'].tolist()
+    
+    # Configuration du graphique : grille flexible selon le nombre de variables
+    n_vars = len(top_predictors)
+    n_cols = 3
+    n_rows = (n_vars + n_cols - 1) // n_cols  # Arrondir vers le haut
+    fig_size = (18, 5 * n_rows)
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=fig_size)
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
+    elif n_cols == 1:
+        axes = axes.reshape(-1, 1)
+    
+    # Lettres pour identifier chaque subplot
+    letters = [f'({chr(97+i)})' for i in range(n_vars)]
+    
+    # Affichage des prédicteurs par ordre d'importance décroissant
+    for i, var in enumerate(top_predictors):
+        row = i // n_cols
+        col = i % n_cols
+        
+        if n_rows == 1:
+            ax = axes[col]
+        else:
+            ax = axes[row, col]
+        
+        temp_df = shap_df[shap_df['Variable'] == var]
+        
+        if len(temp_df) > 0:
+            color = metric_colors.get(response_name, '#1f77b4')
+            
+            # Traitement spécial pour les prédicteurs catégoriels
+            if ((var == 'lake_id' and dataset_name == 'ELA') or 
+                (var.startswith('lake_') and dataset_name == 'ELA')):
+                # Boxplot pour les variables catégorielles (lake_id et variables dummy)
+                unique_values = sorted(temp_df['Valeur'].unique())
+                box_data = [temp_df[temp_df['Valeur'] == val]['SHAP'].values 
+                           for val in unique_values if len(temp_df[temp_df['Valeur'] == val]) > 0]
+                
+                bp = ax.boxplot(box_data, positions=range(len(unique_values)),
+                               patch_artist=True)
+                for patch in bp['boxes']:
+                    patch.set_facecolor(color)
+                    patch.set_alpha(0.7)
+                
+                ax.set_xticks(range(len(unique_values)))
+                # Pour les variables dummy, afficher les valeurs (0, 1)
+                if var.startswith('lake_'):
+                    ax.set_xticklabels([f'{int(val)}' for val in unique_values])
+                else:
+                    ax.set_xticklabels(unique_values)
+            else:
+                # Scatter plot avec ligne de tendance pour les variables continues
+                ax.scatter(temp_df['Valeur'], temp_df['SHAP'], 
+                          alpha=0.3, s=3, color=color)
+                
+                # Ajouter une ligne de tendance
+                if len(temp_df) > 10:
+                    temp_df_sorted = temp_df.sort_values('Valeur')
+                    try:
+                        trend = lowess(temp_df_sorted["SHAP"], temp_df_sorted["Valeur"], frac=0.3)
+                        ax.plot(trend[:, 0], trend[:, 1], color=color, linewidth=2)
+                    except:
+                        pass
+            
+            # Configuration des axes
+            ax.set_xlabel(get_variable_display_name(var), fontsize=14)
+            if col == 0:  # Première colonne
+                ax.set_ylabel('SHAP Value', fontsize=14)
+            
+            # Ligne de zéro
+            ax.axhline(0, color='grey', linestyle='--', alpha=0.5)
+            
+            # Calculer automatiquement les limites SHAP pour voir toutes les courbes
+            if not ((var == 'lake_id' and dataset_name == 'ELA') or 
+                    (var.startswith('lake_') and dataset_name == 'ELA')):
+                # Pour les variables continues, calculer les limites basées sur les données et courbes de tendance
+                trend_line = None
+                if len(temp_df) > 10:
+                    temp_df_sorted = temp_df.sort_values('Valeur')
+                    try:
+                        trend_line = lowess(temp_df_sorted["SHAP"], temp_df_sorted["Valeur"], frac=0.3)
+                    except:
+                        pass
+                
+                shap_limits_auto = get_shap_limits_from_data(temp_df, trend_line)
+                ax.set_ylim(shap_limits_auto[0], shap_limits_auto[1])
+            else:
+                # Pour les variables catégorielles, aligner automatiquement sur zéro
+                y_min, y_max = ax.get_ylim()
+                y_abs_max = max(abs(y_min), abs(y_max))
+                ax.set_ylim(-y_abs_max, y_abs_max)
+            
+            # Ajout de la lettre pour identifier le subplot (si assez de lettres)
+            if i < len(letters):
+                ax.text(0.02, 0.98, letters[i], transform=ax.transAxes, 
+                       fontsize=14, fontweight='bold', verticalalignment='top')
+            
+            ax.tick_params(axis='both', labelsize=12)
+    
+    # Masquer les subplots vides
+    for i in range(n_vars, n_rows * n_cols):
+        row = i // n_cols
+        col = i % n_cols
+        if n_rows == 1:
+            axes[col].set_visible(False)
+        else:
+            axes[row, col].set_visible(False)
+    
+    # PAS DE TITRE comme demandé
+    plt.tight_layout()
+    
+    # Sauvegarder
+    output_name = f"SHAP_{response_name}_{dataset_name}.png"
+    plt.savefig(os.path.join(figures_dir, output_name), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    return shap_values
+
+def get_axis_limits(values, var_name=None, dataset_name=None):
+    """Calculer les limites d'axes basées sur les percentiles avec règles spéciales"""
+    
+    # Variables à ne jamais rogner
+    preserve_vars = ['prev_Mixo', 'prev_Cyano', 'year', 'doy', 'lat', 'long']
+    
+    if var_name in preserve_vars:
+        # Conserver les bornes entières des données
+        return values.min(), values.max()
+    
+    # Pour les autres variables, rogner si peu de points aux extrêmes
+    q01, q99 = np.percentile(values.dropna(), [1, 99])  # Percentiles 1-99%
+    
+    # Vérifier s'il y a peu de points aux extrêmes
+    n_total = len(values.dropna())
+    n_below_q01 = len(values[values < q01])
+    n_above_q99 = len(values[values > q99])
+    
+    # Si moins de 2% des points sont aux extrêmes, rogner
+    if (n_below_q01 < 0.02 * n_total and n_above_q99 < 0.02 * n_total) and n_total > 50:
+        return q01, q99
+    else:
+        # Sinon, conserver toutes les données
+        return values.min(), values.max()
+
+def get_shap_limits_from_data(temp_df, trend_line=None):
+    """Calculer automatiquement les limites SHAP pour voir toutes les courbes LOESS avec alignement des zéros"""
+    
+    if len(temp_df) == 0:
+        return [-1, 1]
+    
+    # Limites basées sur les données SHAP
+    shap_min = temp_df['SHAP'].min()
+    shap_max = temp_df['SHAP'].max()
+    
+    # Si on a une courbe de tendance, inclure ses valeurs
+    if trend_line is not None and len(trend_line) > 0:
+        trend_min = trend_line[:, 1].min()
+        trend_max = trend_line[:, 1].max()
+        shap_min = min(shap_min, trend_min)
+        shap_max = max(shap_max, trend_max)
+    
+    # Ajouter une marge de 10%
+    margin = (shap_max - shap_min) * 0.1
+    shap_min_with_margin = shap_min - margin
+    shap_max_with_margin = shap_max + margin
+    
+    # Forcer la symétrie pour aligner les zéros
+    abs_max = max(abs(shap_min_with_margin), abs(shap_max_with_margin))
+    
+    return [-abs_max, abs_max]
+
+def create_combined_shap_plot(shap_values_dict, X_dict, dataset_name, figures_dir):
+    """Créer un graphique SHAP combiné montrant toutes les métriques ensemble avec leurs couleurs spécifiques"""
+    
+    # Configuration des couleurs pour les métriques
+    metric_colors = {
+        'rich_genus_no_cyano': '#E69F00',    # Jaune/Orange pour richesse
+        'shannon_no_cyano': '#56B4E9',       # Bleu pour Shannon
+        'eveness_piel_no_cyano': '#009E73'   # Vert pour équitabilité
+    }
+    
+    # Collecter toutes les données SHAP combinées
+    all_shap_data = []
+    
+    for response, shap_vals in shap_values_dict.items():
+        X_sample = X_dict[response]
+        
+        # Échantillonnage si nécessaire
+        sample_size = min(2000, len(shap_vals.values))
+        if len(shap_vals.values) > sample_size:
+            sample_idx = np.random.choice(len(shap_vals.values), sample_size, replace=False)
+        else:
+            sample_idx = range(len(shap_vals.values))
+        
+        # Création des données SHAP pour cette métrique
+        for i, col in enumerate(shap_vals.feature_names):
+            for j in sample_idx:
+                # Gérer les variables dummy de lake_id pour ELA
+                if col.startswith('lake_') and dataset_name == 'ELA':
+                    # Extraire le numéro du lac (lake_114 -> 114)
+                    lake_num = col.replace('lake_', '')
+                    # Si cette variable dummy est activée (valeur = 1), ajouter l'entrée avec lake_id
+                    if shap_vals.data[j, i] == 1:
+                        all_shap_data.append({
+                            'Valeur': float(lake_num),  # Convertir en float pour cohérence
+                            'SHAP': shap_vals.values[j, i],
+                            'Variable': 'lake_id',  # Utiliser lake_id comme nom de variable
+                            'Métrique': response
+                        })
+                else:
+                    # Traitement normal pour les autres variables
+                    all_shap_data.append({
+                        'Valeur': shap_vals.data[j, i],
+                        'SHAP': shap_vals.values[j, i],
+                        'Variable': col,
+                        'Métrique': response
+                    })
+    
+    shap_all_df = pd.DataFrame(all_shap_data)
+    
+    # Calculer l'importance globale (moyenne de toutes les métriques)
+    importance_by_var = {}
+    for var in shap_all_df['Variable'].unique():
+        var_data = shap_all_df[shap_all_df['Variable'] == var]
+        importance_by_var[var] = np.abs(var_data['SHAP']).mean()
+    
+    # Pour ELA, si lake_id existe, s'assurer qu'il a une importance raisonnable
+    if dataset_name == 'ELA' and 'lake_id' in importance_by_var:
+        # lake_id étant une variable catégorielle importante, s'assurer qu'elle est bien classée
+        print(f"Importance de lake_id: {importance_by_var['lake_id']:.6f}")
+    
+    # Trier par importance décroissante et prendre les 9 plus importantes
+    top_predictors = sorted(importance_by_var.keys(), key=lambda x: importance_by_var[x], reverse=True)[:9]
+    
+    # Pour ELA, s'assurer absolument que lake_id est inclus
+    if dataset_name == 'ELA' and 'lake_id' in importance_by_var and 'lake_id' not in top_predictors:
+        # Forcer l'inclusion de lake_id en remplaçant la dernière variable
+        print(f"Inclusion forcée de lake_id dans les graphiques SHAP pour ELA")
+        top_predictors[-1] = 'lake_id'
+    
+    print(f"Top predictors pour {dataset_name}: {top_predictors}")
+    
+    # Configuration du graphique : 3x3 pour les 9 prédicteurs les plus importants
+    n_vars = 9
+    n_cols = 3
+    n_rows = 3
+    fig_size = (18, 15)
     
     fig, axes = plt.subplots(n_rows, n_cols, figsize=fig_size)
     if n_rows == 1:
         axes = axes.reshape(1, -1)
     
-    # Séparer les métriques : Shannon et Équitabilité (axe gauche), Richesse (axe droit)
+    # Lettres pour identifier chaque subplot
+    letters = ['(a)', '(b)', '(c)', '(d)', '(e)', '(f)', '(g)', '(h)', '(i)']
+    
+    # Séparer les métriques par type d'axe
     shannon_eveness_metrics = ['shannon_no_cyano', 'eveness_piel_no_cyano']
     richness_metric = ['rich_genus_no_cyano']
     
-    # Lettres pour identifier chaque subplot par ordre d'importance
-    letters = ['(a)', '(b)', '(c)', '(d)', '(e)', '(f)', '(g)', '(h)', '(i)']
+    # Calculer les échelles SHAP communes pour harmonisation
+    print(f"Calcul des échelles SHAP automatiques basées sur les courbes LOESS...")
     
-    # Calculer les échelles SHAP communes pour harmonisation intra-rangée
-    print(f"Calcul des échelles SHAP communes pour harmonisation intra-rangée...")
+    # Dictionnaire pour stocker les limites calculées automatiquement
+    shap_limits_auto = {}
     
-    # Pour Shannon et Équitabilité (axe gauche)
-    all_shannon_eveness_shap = []
-    for metric in shannon_eveness_metrics:
-        if metric in responses:
-            metric_shap_values = shap_all_df[shap_all_df['Métrique'] == metric]['SHAP'].values
-            all_shannon_eveness_shap.extend(metric_shap_values)
-
-    if all_shannon_eveness_shap:
-        shannon_eveness_min = np.percentile(all_shannon_eveness_shap, 2.5)
-        shannon_eveness_max = np.percentile(all_shannon_eveness_shap, 97.5)
-        shannon_eveness_abs_max = max(abs(shannon_eveness_min), abs(shannon_eveness_max))
-        # Ajouter une marge adaptée selon le dataset pour éviter le crop des données
-        if dataset_name == "LPNLA":
-            # Pour LPNLA, augmenter davantage les limites de Shannon et Équitabilité
-            shannon_eveness_abs_max *= 1.25  # 25% de marge au lieu de 15%
+    # Calculer les limites pour chaque position
+    for i, var in enumerate(top_predictors):
+        temp_df = shap_all_df[shap_all_df['Variable'] == var]
+        
+        # Calculer les courbes de tendance pour chaque métrique
+        shannon_eveness_trends = []
+        richness_trends = []
+        
+        # Shannon et Équitabilité
+        for metric in shannon_eveness_metrics:
+            if metric in responses:
+                metric_data = temp_df[temp_df['Métrique'] == metric]
+                if len(metric_data) > 10:
+                    metric_data_sorted = metric_data.sort_values('Valeur')
+                    try:
+                        trend = lowess(metric_data_sorted["SHAP"], metric_data_sorted["Valeur"], frac=0.3)
+                        shannon_eveness_trends.append(trend)
+                    except:
+                        pass
+        
+        # Richesse
+        for metric in richness_metric:
+            if metric in responses:
+                metric_data = temp_df[temp_df['Métrique'] == metric]
+                if len(metric_data) > 10:
+                    metric_data_sorted = metric_data.sort_values('Valeur')
+                    try:
+                        trend = lowess(metric_data_sorted["SHAP"], metric_data_sorted["Valeur"], frac=0.3)
+                        richness_trends.append(trend)
+                    except:
+                        pass
+        
+        # Calculer les limites pour Shannon & Équitabilité
+        if shannon_eveness_trends:
+            all_se_data = temp_df[temp_df['Métrique'].isin(shannon_eveness_metrics)]
+            combined_trend = np.vstack(shannon_eveness_trends) if len(shannon_eveness_trends) > 1 else shannon_eveness_trends[0]
+            hj_limits = get_shap_limits_from_data(all_se_data, combined_trend)
         else:
-            shannon_eveness_abs_max *= 1.15  # 15% de marge pour ELA
-        common_shannon_eveness_lim = [-shannon_eveness_abs_max, shannon_eveness_abs_max]
-    else:
-        common_shannon_eveness_lim = [-1, 1]
-
-    # Pour Richesse (axe droit)
-    all_richness_shap = []
-    for metric in richness_metric:
-        if metric in responses:
-            metric_shap_values = shap_all_df[shap_all_df['Métrique'] == metric]['SHAP'].values
-            all_richness_shap.extend(metric_shap_values)
-
-    if all_richness_shap:
-        richness_min = np.percentile(all_richness_shap, 2.5)
-        richness_max = np.percentile(all_richness_shap, 97.5)
-        richness_abs_max = max(abs(richness_min), abs(richness_max))
-        # Ajouter une marge de 15% pour éviter le crop des données
-        richness_abs_max *= 1.15
-        common_richness_lim = [-richness_abs_max, richness_abs_max]
-    else:
-        common_richness_lim = [-1, 1]
+            all_se_data = temp_df[temp_df['Métrique'].isin(shannon_eveness_metrics)]
+            hj_limits = get_shap_limits_from_data(all_se_data)
+        
+        # Calculer les limites pour Richesse
+        if richness_trends:
+            all_r_data = temp_df[temp_df['Métrique'].isin(richness_metric)]
+            combined_trend = np.vstack(richness_trends) if len(richness_trends) > 1 else richness_trends[0]
+            s_limits = get_shap_limits_from_data(all_r_data, combined_trend)
+        else:
+            all_r_data = temp_df[temp_df['Métrique'].isin(richness_metric)]
+            s_limits = get_shap_limits_from_data(all_r_data)
+        
+        # Stocker les limites pour cette position
+        shap_limits_auto[i] = {'S': s_limits, 'HJ': hj_limits}
+        
+        print(f"  Position {i} ({var}): S {s_limits}, HJ {hj_limits}")
     
-    print(f"  Échelle commune Shannon/Équitabilité: {common_shannon_eveness_lim}")
-    print(f"  Échelle commune Richesse: {common_richness_lim}")
+    print(f"  Limites SHAP automatiques calculées pour {dataset_name}")
     
-    # Affichage des prédicteurs par ordre d'importance décroissant (position 0,0 = plus important)
+    # Utiliser les limites automatiques calculées
+    shap_limits = shap_limits_auto
+    
+    # Affichage des prédicteurs par ordre d'importance décroissant
     for i, var in enumerate(top_predictors):
         row = i // n_cols
         col = i % n_cols
@@ -935,23 +643,14 @@ def create_combined_shap_plot(shap_dfs, responses, covariable, figures_dir, data
                         richness_plotted = True
             
             # Configuration des axes pour les prédicteurs catégoriels
-            # Utiliser le nom traduit pour l'affichage
-            display_name = predictor_mapping.get(var, var)
-            ax1.set_xlabel(display_name, fontsize=18)
+            ax1.set_xlabel(get_variable_display_name(var), fontsize=18)
             ax1.set_xticks(range(len(unique_values)))
-            ax1.set_xticklabels(unique_values, fontsize=16)
+            ax1.set_xticklabels([f'{int(val)}' for val in unique_values], fontsize=16)
             
         else:
             # Traitement normal pour les prédicteurs continus
-            # Calculer les limites d'axes basées sur les percentiles pour ce prédicteur
-            x_min, x_max = get_axis_limits(temp_df['Valeur'])
-            
-            # Règles spéciales pour conserver les bornes entières de certains prédicteurs ELA
-            if dataset_name == "ELA" and var in ['prev_Mixo', 'doy']:
-                # Pour prev_Mixo et doy dans ELA, garder les bornes entières des données
-                x_min = temp_df['Valeur'].min()
-                x_max = temp_df['Valeur'].max()
-                print(f"  Conservation des bornes entières pour {var}: [{x_min:.1f}, {x_max:.1f}]")
+            # Calculer les limites d'axes avec rognage adaptatif
+            x_min, x_max = get_axis_limits(temp_df['Valeur'], var, dataset_name)
             
             # Axe gauche : Shannon et Équitabilité
             for metric in shannon_eveness_metrics:
@@ -971,6 +670,10 @@ def create_combined_shap_plot(shap_dfs, responses, covariable, figures_dir, data
                             except:
                                 pass
                         shannon_eveness_plotted = True
+            
+            # Définir les limites d'axe X après avoir traité toutes les métriques
+            if 'x_min' in locals() and 'x_max' in locals():
+                ax1.set_xlim(x_min, x_max)
             
             # Axe droit : Richesse
             for metric in richness_metric:
@@ -994,15 +697,7 @@ def create_combined_shap_plot(shap_dfs, responses, covariable, figures_dir, data
                         richness_plotted = True
             
             # Configuration des axes pour les prédicteurs continus
-            # Utiliser le nom traduit pour l'affichage
-            display_name = predictor_mapping.get(var, var)
-            ax1.set_xlabel(display_name, fontsize=18)
-            
-            # Appliquer les limites d'axes calculées pour borner aux valeurs principales
-            if x_min is not None and x_max is not None:
-                ax1.set_xlim(x_min, x_max)
-                if ax2 is not None:
-                    ax2.set_xlim(x_min, x_max)
+            ax1.set_xlabel(get_variable_display_name(var), fontsize=18)
         
         # Configuration des labels d'axes Y avec contrôle de visibilité
         # Axe gauche (Shannon & Équitabilité) : visible seulement sur la colonne de gauche
@@ -1034,12 +729,16 @@ def create_combined_shap_plot(shap_dfs, responses, covariable, figures_dir, data
         if ax2 is not None:
             ax2.axhline(0, color='grey', linestyle='--', alpha=0.5)
         
-        # Appliquer les échelles communes pour harmonisation intra-rangée
-        if shannon_eveness_plotted:
-            ax1.set_ylim(common_shannon_eveness_lim[0], common_shannon_eveness_lim[1])
-        
-        if richness_plotted and ax2 is not None:
-            ax2.set_ylim(common_richness_lim[0], common_richness_lim[1])
+        # Aligner les lignes zéro en définissant des limites symétriques selon la position
+        # Utiliser les limites automatiques calculées pour cette position
+        if i in shap_limits:
+            if shannon_eveness_plotted:
+                hj_limits = shap_limits[i]['HJ']
+                ax1.set_ylim(hj_limits[0], hj_limits[1])
+            
+            if richness_plotted and ax2 is not None:
+                s_limits = shap_limits[i]['S']
+                ax2.set_ylim(s_limits[0], s_limits[1])
         
         # Ajout de la lettre pour identifier le subplot (par ordre d'importance)
         ax1.text(0.02, 0.98, letters[i], transform=ax1.transAxes, 
@@ -1048,203 +747,62 @@ def create_combined_shap_plot(shap_dfs, responses, covariable, figures_dir, data
         # Améliorer la taille des ticks
         ax1.tick_params(axis='x', labelsize=16)
     
+    # PAS DE TITRE comme demandé
     plt.tight_layout()
-    plt.savefig(f"{figures_dir}/SHAP_all_{dataset_name}.png", dpi=300, bbox_inches='tight')
+    plt.savefig(os.path.join(figures_dir, f"SHAP_all_{dataset_name}.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
-def create_individual_shap_plots(shap_dfs, responses, covariable, figures_dir, dataset_name):
-    """Créer des figures SHAP individuelles pour chaque métrique de diversité"""
-    print(f"Génération des figures SHAP individuelles pour {dataset_name}")
-    
-    # Mapper les noms de prédicteurs pour l'affichage
-    predictor_mapping = {
-        'year': 'Year',
-        'doy': 'Doy', 
-        'lat': 'Lat',
-        'long': 'Long',
-        'area_m2': 'Area',
-        'COND_uS.cm': 'COND',
-        'Chla_ug.L': 'Chla',
-        'TNTP_mg.L': 'TNTP',
-        'pH_mean': 'pH mean',
-        'DO_up': 'DO up',
-        'DO_bottom': 'DO bottom',
-        'Biom_Cladocera_ugL': 'Biom Cladocera',
-        'Biom_Copepoda_ugL': 'Biom Copepoda',
-        'color': 'Color',
-        'temp_up': 'Temp up',
-        'temp_bottom': 'Temp bottom',
-        'wind_30d': 'Wind 30d',
-        'tp_30d': 'TP 30d',
-        'degree_day_thr0': 'Degree day > 0',
-        'prev_Cyano': 'Prev Cyano',
-        'prev_Mixo': 'Prev Mixo',
-        'lake_id': 'Lake ID'
-        # Variables lag supprimées selon les demandes de simplification
-    }
-    
-    # Définir les couleurs fixes pour chaque métrique (colorblind-friendly)
-    metric_colors = {
-        'rich_genus_no_cyano': '#E69F00',    # Orange
-        'shannon_no_cyano': '#56B4E9',       # Bleu ciel
-        'eveness_piel_no_cyano': '#009E73'   # Vert bleu
-    }
-    
-    metric_names = {
-        'rich_genus_no_cyano': 'Richesse Générique',
-        'shannon_no_cyano': 'Diversité Shannon',
-        'eveness_piel_no_cyano': 'Équitabilité Pielou'
-    }
-    
-    # Pour chaque métrique, créer une figure individuelle
-    for i, response in enumerate(responses):
-        print(f"  Création de la figure SHAP pour {metric_names[response]}")
-        
-        shap_df = shap_dfs[i]
-        
-        # Calculer l'importance moyenne absolue pour chaque prédicteur pour cette métrique
-        importance_by_var = shap_df.groupby('Variable')['SHAP'].apply(lambda x: np.abs(x).mean()).sort_values(ascending=False)
-        
-        # Garder tous les prédicteurs pour les figures individuelles
-        top_predictors = importance_by_var.index.tolist()
-        print(f"    Tous les prédicteurs pour {metric_names[response]} ({len(top_predictors)} variables): {top_predictors[:5]}...")
-        
-        # Filtrer les données pour tous les prédicteurs
-        metric_shap_df = shap_df[shap_df['Variable'].isin(top_predictors)].copy()
-        metric_shap_df['Variable'] = pd.Categorical(metric_shap_df['Variable'], categories=top_predictors, ordered=True)
-        metric_shap_df = metric_shap_df.sort_values('Variable')
-        
-        # Configuration dynamique basée sur le nombre de prédicteurs
-        n_predictors = len(top_predictors)
-        n_cols = 4  # 4 colonnes pour un meilleur rendu
-        n_rows = (n_predictors + n_cols - 1) // n_cols  # Calcul du nombre de lignes nécessaires
-        fig_size = (20, 5 * n_rows)  # Taille adaptée au nombre de lignes
-        
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=fig_size)
-        if n_rows == 1:
-            axes = axes.reshape(1, -1)
-        elif n_cols == 1:
-            axes = axes.reshape(-1, 1)
-        else:
-            axes = axes.reshape(n_rows, n_cols)
-        
-        # Lettres pour identifier chaque subplot
-        letters = [f'({chr(97+i)})' for i in range(n_predictors)]  # (a), (b), (c), etc.
-        
-        # Couleur unique pour cette métrique
-        color = metric_colors[response]
-        
-        # Affichage des prédicteurs par ordre d'importance décroissant
-        for j, var in enumerate(top_predictors):
-            row = j // n_cols
-            col = j % n_cols
-            
-            # Vérifier que nous ne dépassons pas les axes disponibles
-            if row >= n_rows:
-                break
-                
-            ax = axes[row, col] if n_rows > 1 else axes[col]
-            
-            temp_df = metric_shap_df[metric_shap_df['Variable'] == var]
-            
-            # Échantillonnage pour optimiser le rendu
-            if len(temp_df) > 2000:
-                temp_df = temp_df.sample(n=2000, random_state=42)
-            
-            # Traitement spécial pour les prédicteurs catégoriels
-            if (var == 'lake_id' and dataset_name == 'ELA'):
-                # Récupérer les modalités uniques
-                unique_values = sorted(temp_df['Valeur'].unique())
-                
-                # Créer le boxplot pour la variable catégorielle
-                bp = ax.boxplot([temp_df[temp_df['Valeur'] == cat_value]['SHAP'].values 
-                               for cat_value in unique_values if len(temp_df[temp_df['Valeur'] == cat_value]) > 0],
-                               patch_artist=True, 
-                               boxprops=dict(facecolor=color, alpha=0.7),
-                               medianprops=dict(color='black'),
-                               whiskerprops=dict(color='black'),
-                               capprops=dict(color='black'))
-                
-                # Configuration des axes pour les prédicteurs catégoriels
-                display_name = predictor_mapping.get(var, var)
-                ax.set_xlabel(display_name, fontsize=18)
-                ax.set_xticks(range(len(unique_values)))
-                ax.set_xticklabels(unique_values, fontsize=16)
-                
-            else:
-                # Traitement normal pour les prédicteurs continus
-                # Calculer les limites d'axes basées sur les percentiles
-                x_min, x_max = get_axis_limits(temp_df['Valeur'])
-                
-                # Scatter plot avec ligne de tendance
-                ax.scatter(temp_df['Valeur'], temp_df['SHAP'], 
-                          alpha=0.3, s=3, color=color)
-                
-                # Ajouter une ligne de tendance
-                if len(temp_df) > 10:
-                    temp_df_sorted = temp_df.sort_values('Valeur')
-                    try:
-                        trend = lowess(temp_df_sorted["SHAP"], temp_df_sorted["Valeur"], frac=0.3)
-                        ax.plot(trend[:, 0], trend[:, 1], color=color, linewidth=3)
-                    except:
-                        pass
-                
-                # Configuration des axes pour les prédicteurs continus
-                display_name = predictor_mapping.get(var, var)
-                ax.set_xlabel(display_name, fontsize=18)
-                
-                # Appliquer les limites d'axes calculées
-                if x_min is not None and x_max is not None:
-                    ax.set_xlim(x_min, x_max)
-            
-            # Configuration des labels d'axes Y
-            if col == 0:  # Colonne de gauche
-                ax.set_ylabel(f'SHAP ({metric_names[response]})', fontsize=18)
-                ax.tick_params(axis='y', labelsize=16)
-            else:
-                ax.set_ylabel('')
-                ax.tick_params(axis='y', labelleft=False)
-            
-            # Ligne de zéro
-            ax.axhline(0, color='grey', linestyle='--', alpha=0.5)
-            
-            # Définir des limites symétriques pour l'axe Y
-            y_min, y_max = ax.get_ylim()
-            y_abs_max = max(abs(y_min), abs(y_max))
-            ax.set_ylim(-y_abs_max, y_abs_max)
-            
-            # Ajout de la lettre pour identifier le subplot
-            if j < len(letters):
-                ax.text(0.02, 0.98, letters[j], transform=ax.transAxes, 
-                       fontsize=16, fontweight='bold', verticalalignment='top')
-            
-            # Améliorer la taille des ticks
-            ax.tick_params(axis='x', labelsize=16)
-        
-        # Masquer les axes vides s'il y en a
-        total_subplots = n_rows * n_cols
-        for empty_idx in range(n_predictors, total_subplots):
-            empty_row = empty_idx // n_cols
-            empty_col = empty_idx % n_cols
-            if empty_row < n_rows:
-                empty_ax = axes[empty_row, empty_col] if n_rows > 1 else axes[empty_col]
-                empty_ax.set_visible(False)
-        
-        # Titre global pour la figure
-        fig.suptitle(f'Analyse SHAP - {metric_names[response]} ({dataset_name})', 
-                     fontsize=24, fontweight='bold', y=0.98)
-        
-        plt.tight_layout()
-        plt.subplots_adjust(top=0.94)  # Ajuster pour le titre
-        
-        # Sauvegarder la figure individuelle
-        response_clean = response.replace('_no_cyano', '').replace('_', '')
-        plt.savefig(f"{figures_dir}/SHAP_{response_clean}_{dataset_name}.png", dpi=300, bbox_inches='tight')
-        plt.close()
-
-def create_combined_shap_rank_plot(shap_rank_data_ela, shap_rank_data_lpnla):
+def create_combined_shap_rank_plot(shap_results_all):
     """Créer un boxplot combiné des ranks SHAP pour ELA et LPNLA basé sur l'importance cumulée"""
     print("Génération du boxplot combiné des ranks SHAP ELA + LPNLA (ordre par importance cumulée)")
+    
+    # Extraire les données de ranking SHAP pour chaque dataset
+    shap_rank_data_ela = []
+    shap_rank_data_lpnla = []
+    
+    # Traiter ELA
+    if 'ELA' in shap_results_all:
+        for response, shap_values in shap_results_all['ELA'].items():
+            # Calculer l'importance moyenne de chaque variable
+            importance = np.abs(shap_values.values).mean(0)
+            feature_names = shap_values.feature_names
+            
+            # Créer les rangs (1 = plus important)
+            ranks = np.argsort(np.argsort(-importance)) + 1
+            
+            # Ajouter aux données ELA
+            for i, feature in enumerate(feature_names):
+                # Traitement spécial pour les variables dummy de lake_id
+                if feature.startswith('lake_'):
+                    feature_clean = 'lake_id'
+                else:
+                    feature_clean = feature
+                
+                shap_rank_data_ela.append({
+                    'Predictor': feature_clean,
+                    'Rank': ranks[i],
+                    'Response': response,
+                    'Importance': importance[i]
+                })
+    
+    # Traiter LPNLA
+    if 'LPNLA' in shap_results_all:
+        for response, shap_values in shap_results_all['LPNLA'].items():
+            # Calculer l'importance moyenne de chaque variable
+            importance = np.abs(shap_values.values).mean(0)
+            feature_names = shap_values.feature_names
+            
+            # Créer les rangs (1 = plus important)
+            ranks = np.argsort(np.argsort(-importance)) + 1
+            
+            # Ajouter aux données LPNLA
+            for i, feature in enumerate(feature_names):
+                shap_rank_data_lpnla.append({
+                    'Predictor': feature,
+                    'Rank': ranks[i],
+                    'Response': response,
+                    'Importance': importance[i]
+                })
     
     # Créer les DataFrames
     df_ela = pd.DataFrame(shap_rank_data_ela) if shap_rank_data_ela else pd.DataFrame()
@@ -1262,6 +820,10 @@ def create_combined_shap_rank_plot(shap_rank_data_ela, shap_rank_data_lpnla):
         all_predictors.update(df_ela['Predictor'].unique())
     if len(df_lpnla) > 0:
         all_predictors.update(df_lpnla['Predictor'].unique())
+    
+    if not all_predictors:
+        print("Aucune donnée SHAP disponible pour créer le graphique de ranking")
+        return None
     
     # Calculer l'importance cumulée (inverse du rang médian) pour chaque prédicteur
     cumulative_importance = {}
@@ -1325,7 +887,7 @@ def create_combined_shap_rank_plot(shap_rank_data_ela, shap_rank_data_lpnla):
         
         # Ajouter les labels pour ce prédicteur
         tick_positions.append(base_pos + 0.5)  # Position centrale entre ELA et LPNLA
-        tick_labels.append(predictor)
+        tick_labels.append(get_variable_display_name(predictor))
     
     # Configuration des axes avec texte plus grand
     plt.ylabel("SHAP rank", fontsize=20)
@@ -1352,7 +914,7 @@ def create_combined_shap_rank_plot(shap_rank_data_ela, shap_rank_data_lpnla):
     plt.tight_layout()
     
     # Sauvegarder la figure avec résolution plus élevée
-    combined_figures_dir = "/Users/renaudsrr/Desktop/STAGE_MTL/MODELISATION/figures/figures_model"
+    combined_figures_dir = "/Users/renaudsrr/Desktop/STAGE_MTL/MODELISATION/NEW_ALL/FIGURES"
     os.makedirs(combined_figures_dir, exist_ok=True)
     plt.savefig(f"{combined_figures_dir}/SHAP_rank_combined.png", dpi=300, bbox_inches='tight')
     plt.close()
@@ -1361,335 +923,374 @@ def create_combined_shap_rank_plot(shap_rank_data_ela, shap_rank_data_lpnla):
     return f"{combined_figures_dir}/SHAP_rank_combined.png"
 
 ###############################################################################
-# Fonction d'export LaTeX
+# Fonctions d'analyse des résidus
 ###############################################################################
 
-def export_combined_latex_results(shap_data_ela, shap_data_lpnla, metrics_ela=None, metrics_lpnla=None):
-    """Exporter un tableau LaTeX combiné avec les valeurs SHAP, MAE et R² des deux datasets"""
-    print("Génération du tableau LaTeX combiné ELA + LPNLA avec MAE et R²")
+def create_residuals_analysis(models_dict, X_dict, y_dict, dataset_name, figures_dir):
+    """Créer l'analyse des résidus complète"""
     
-    # Définir le dossier tables correct
-    tables_dir = "/Users/renaudsrr/Desktop/STAGE_MTL/MODELISATION/figures/figures_model/tables"
-    os.makedirs(tables_dir, exist_ok=True)
+    # Déterminer le nombre de métriques
+    n_metrics = len(models_dict)
     
-    # Calculer les valeurs SHAP moyennes pour ELA
-    shap_means_ela = {}
-    if shap_data_ela:
-        for i, resp in enumerate(responses):
-            if i < len(shap_data_ela):
-                shap_df = shap_data_ela[i]
-                mean_abs_shap = shap_df.groupby('Variable')['SHAP'].apply(lambda x: np.abs(x).mean())
-                shap_means_ela[resp] = mean_abs_shap
-    
-    # Calculer les valeurs SHAP moyennes pour LPNLA
-    shap_means_lpnla = {}
-    if shap_data_lpnla:
-        for i, resp in enumerate(responses):
-            if i < len(shap_data_lpnla):
-                shap_df = shap_data_lpnla[i]
-                mean_abs_shap = shap_df.groupby('Variable')['SHAP'].apply(lambda x: np.abs(x).mean())
-                shap_means_lpnla[resp] = mean_abs_shap
-    
-    # Mapper les noms de prédicteurs aux noms LaTeX
-    predictor_mapping = {
-        'year': 'Year',
-        'doy': 'Doy', 
-        'lat': 'Lat',
-        'long': 'Long',
-        'area_m2': 'Area',
-        'COND_uS.cm': 'COND',
-        'Chla_ug.L': 'Chla',
-        'TNTP_mg.L': 'TNTP',
-        'pH_mean': 'pH mean',
-        'DO_up': 'DO up',
-        'DO_bottom': 'DO bottom',
-        'Biom_Cladocera_ugL': 'Biom Cladocera',
-        'Biom_Copepoda_ugL': 'Biom Copepoda',
-        'color': 'Color',
-        'temp_up': 'Temp up',
-        'temp_bottom': 'Temp bottom',
-        'wind_30d': 'Wind 30d',
-        'tp_30d': 'TP 30d',
-        'degree_day_thr0': 'Degree day > 0',
-        'prev_Cyano': 'Prev Cyano',
-        'prev_Mixo': 'Prev Mixo',
-        'lake_id': 'Lake ID',
-        # Variables lag
-        'rich_genus_no_cyano_lag1m_o1': 'Richesse lag 1',
-        'shannon_no_cyano_lag1m_o1': 'Shannon lag 1',
-        'eveness_piel_no_cyano_lag1m_o1': 'Équitabilité lag 1'
-    }
-    
-    # Liste des prédicteurs dans l'ordre voulu
-    all_predictors = [
-        'lake_id', 'year', 'doy', 'lat', 'long', 'area_m2', 'COND_uS.cm', 'Chla_ug.L', 
-        'TNTP_mg.L', 'pH_mean', 'DO_up', 'DO_bottom', 'Biom_Cladocera_ugL',
-        'Biom_Copepoda_ugL', 'color', 'temp_up', 'temp_bottom', 'wind_30d',
-        'tp_30d', 'degree_day_thr0', 'prev_Cyano', 'prev_Mixo',
-        # Variables lag
-        'rich_genus_no_cyano_lag1m_o1', 'shannon_no_cyano_lag1m_o1', 'eveness_piel_no_cyano_lag1m_o1'
-    ]
-    
-    # Définir quels prédicteurs sont disponibles pour chaque dataset
-    lpnla_predictors = ['lat', 'long', 'area_m2', 'COND_uS.cm', 'Chla_ug.L', 
-                        'TNTP_mg.L', 'pH_mean', 'DO_up', 'DO_bottom', 
-                        'Biom_Cladocera_ugL', 'Biom_Copepoda_ugL', 'color', 
-                        'temp_up', 'temp_bottom', 'wind_30d', 'tp_30d', 
-                        'degree_day_thr0', 'prev_Mixo', 'prev_Cyano']
-    
-    ela_predictors = ['lake_id', 'year', 'doy', 'COND_uS.cm',
-                      'Chla_ug.L', 'TNTP_mg.L', 'pH_mean', 'DO_up', 'DO_bottom',
-                      'prev_Cyano', 'prev_Mixo',
-                      # Variables lag pour ELA
-                      'rich_genus_no_cyano_lag1m_o1', 'shannon_no_cyano_lag1m_o1', 'eveness_piel_no_cyano_lag1m_o1']
-    
-    # Générer le tableau LaTeX
-    latex_lines = []
-    
-    latex_lines.append("\\begin{table}[H]")
-    latex_lines.append("\\centering")
-    latex_lines.append("\\renewcommand{\\arraystretch}{1.2}")
-    latex_lines.append("\\setlength{\\tabcolsep}{4pt}")
-    latex_lines.append("\\caption{Métriques de performance (MAE et R² moyens sur validation) et valeurs SHAP absolues moyennes pour chacun des modèles de diversité. Les valeurs NA correspondent aux prédicteurs absents du jeu de données.}")
-    latex_lines.append("\\label{tab:metrics_shap_models_all}")
-    latex_lines.append("\\begin{tabular}{lcccccc}")
-    latex_lines.append("\\toprule")
-    latex_lines.append("\\multirow{2}{*}{\\textbf{Prédicteur}} & \\multicolumn{3}{c}{\\textbf{LP-NLA}} & \\multicolumn{3}{c}{\\textbf{ELA}} \\\\")
-    latex_lines.append("\\cmidrule(lr){2-4} \\cmidrule(lr){5-7}")
-    latex_lines.append("& $S$ & $H'$ & $J'$ & $S$ & $H'$ & $J'$ \\\\")
-    latex_lines.append("\\midrule")
-    
-    # Calculer les moyennes des métriques
-    def calculate_mean_metrics(metrics_list):
-        if not metrics_list:
-            return {'mae': {'rich_genus_no_cyano': 0, 'shannon_no_cyano': 0, 'eveness_piel_no_cyano': 0},
-                    'r2': {'rich_genus_no_cyano': 0, 'shannon_no_cyano': 0, 'eveness_piel_no_cyano': 0}}
-        
-        mae_means = {}
-        r2_means = {}
-        
-        for resp in responses:
-            resp_metrics = [m for m in metrics_list if resp in [item for item in metrics_list[0].keys() if 'mae' in str(item)]]
-            mae_values = [m['mae'] for m in metrics_list if 'mae' in m]
-            r2_values = [m['r2'] for m in metrics_list if 'r2' in m]
-            
-            mae_means[resp] = np.mean(mae_values) if mae_values else 0
-            r2_means[resp] = np.mean(r2_values) if r2_values else 0
-        
-        return {'mae': mae_means, 'r2': r2_means}
-    
-    # Obtenir les moyennes (simplifiées pour cette version)
-    mae_s_lpnla = mae_h_lpnla = mae_j_lpnla = "--"
-    mae_s_ela = mae_h_ela = mae_j_ela = "--"
-    r2_s_lpnla = r2_h_lpnla = r2_j_lpnla = "--"
-    r2_s_ela = r2_h_ela = r2_j_ela = "--"
-    
-    latex_lines.append(f"MAE          & {mae_s_lpnla} & {mae_h_lpnla} & {mae_j_lpnla} & {mae_s_ela} & {mae_h_ela} & {mae_j_ela} \\\\")
-    latex_lines.append(f"R² validation & {r2_s_lpnla} & {r2_h_lpnla} & {r2_j_lpnla} & {r2_s_ela} & {r2_h_ela} & {r2_j_ela} \\\\")
-    latex_lines.append("\\addlinespace")
-    latex_lines.append("\\midrule")
-    
-    for predictor in all_predictors:
-        latex_name = predictor_mapping.get(predictor, predictor)
-        
-        # Valeurs pour LP-NLA
-        if predictor in lpnla_predictors:
-            if shap_means_lpnla:
-                s_val = f"{shap_means_lpnla.get('rich_genus_no_cyano', {}).get(predictor, 0):.3f}" if 'rich_genus_no_cyano' in shap_means_lpnla and predictor in shap_means_lpnla.get('rich_genus_no_cyano', {}) else "--"
-                h_val = f"{shap_means_lpnla.get('shannon_no_cyano', {}).get(predictor, 0):.3f}" if 'shannon_no_cyano' in shap_means_lpnla and predictor in shap_means_lpnla.get('shannon_no_cyano', {}) else "--"
-                j_val = f"{shap_means_lpnla.get('eveness_piel_no_cyano', {}).get(predictor, 0):.3f}" if 'eveness_piel_no_cyano' in shap_means_lpnla and predictor in shap_means_lpnla.get('eveness_piel_no_cyano', {}) else "--"
-            else:
-                s_val = h_val = j_val = "--"
-        else:
-            s_val = h_val = j_val = "NA"
-        
-        # Valeurs pour ELA
-        if predictor in ela_predictors:
-            if shap_means_ela:
-                s_ela = f"{shap_means_ela.get('rich_genus_no_cyano', {}).get(predictor, 0):.3f}" if 'rich_genus_no_cyano' in shap_means_ela and predictor in shap_means_ela.get('rich_genus_no_cyano', {}) else "--"
-                h_ela = f"{shap_means_ela.get('shannon_no_cyano', {}).get(predictor, 0):.3f}" if 'shannon_no_cyano' in shap_means_ela and predictor in shap_means_ela.get('shannon_no_cyano', {}) else "--"
-                j_ela = f"{shap_means_ela.get('eveness_piel_no_cyano', {}).get(predictor, 0):.3f}" if 'eveness_piel_no_cyano' in shap_means_ela and predictor in shap_means_ela.get('eveness_piel_no_cyano', {}) else "--"
-            else:
-                s_ela = h_ela = j_ela = "--"
-        else:
-            s_ela = h_ela = j_ela = "NA"
-        
-        latex_lines.append(f"{latex_name:<20} & {s_val} & {h_val} & {j_val} & {s_ela} & {h_ela} & {j_ela} \\\\")
-    
-    latex_lines.append("\\bottomrule")
-    latex_lines.append("\\end{tabular}")
-    latex_lines.append("\\end{table}")
-    
-    # Sauvegarder le fichier LaTeX combiné
-    latex_file = f"{tables_dir}/shap_values_table_combined.tex"
-    with open(latex_file, 'w', encoding='utf-8') as f:
-        for line in latex_lines:
-            f.write(line + '\n')
-    
-    print(f"Tableau LaTeX combiné généré : {latex_file}")
-    return latex_file
-
-###############################################################################
-# Fonction principale d'analyse
-###############################################################################
-
-def analyze_dataset(dataset_name):
-    """Analyser un dataset spécifique"""
-    print(f"\\n=== Analyse du dataset {dataset_name} ===")
-    start_time = time.time()
-    
-    # Charger les données et créer les répertoires
-    df, covariable = load_data(dataset_name)
-    figures_dir, tables_dir = create_directories(dataset_name)
-    
-    # Préparation des arguments pour la parallélisation
-    all_args = []
-    
+    # Configuration selon le dataset
     if dataset_name == 'ELA':
-        # Leave-One-Year-Out validation
-        for resp in responses:
-            years = df['year'].unique()
-            for test_year in years:
-                all_args.append((resp, test_year, df, covariable))
-        
-        # Traitement parallèle
-        n_cores = min(mp.cpu_count() - 1, 8)
-        print(f"Utilisation de {n_cores} cœurs CPU")
-        
-        with ProcessPoolExecutor(max_workers=n_cores) as executor:
-            results = list(executor.map(process_response_year_ela, all_args))
-        
-        # Regroupement des résultats
-        response_data = {resp: [] for resp in responses}
-        shap_rank_data = []
-        all_metrics = []
-        
-        for i, (resp, test_year, _, _) in enumerate(all_args):
-            shap_data, rank_data, metrics = results[i]
-            response_data[resp].extend(shap_data)
-            shap_rank_data.extend(rank_data)
-            all_metrics.append(metrics)
+        # Pour ELA : 6 lignes (résidus vs prédictions, Q-Q plot, histogramme, résidus vs year, résidus vs doy, résidus vs valeurs observées)
+        fig, axes = plt.subplots(6, n_metrics, figsize=(6*n_metrics, 24))
+    else:
+        # Pour LPNLA : 6 lignes (résidus vs prédictions, Q-Q plot, histogramme, résidus vs lat, résidus vs long, résidus vs valeurs observées)
+        fig, axes = plt.subplots(6, n_metrics, figsize=(6*n_metrics, 24))
     
-    else:  # LPNLA
-        # K-fold validation
-        kf = KFold(n_splits=5, shuffle=True, random_state=42)
-        
-        for resp in responses:
-            for fold_idx, (train_idx, val_idx) in enumerate(kf.split(df)):
-                all_args.append((resp, fold_idx, train_idx, val_idx, df, covariable))
-        
-        # Traitement parallèle
-        n_cores = min(mp.cpu_count() - 1, 8)
-        print(f"Utilisation de {n_cores} cœurs CPU")
-        
-        with ProcessPoolExecutor(max_workers=n_cores) as executor:
-            results = list(executor.map(process_response_fold_lpnla, all_args))
-        
-        # Regroupement des résultats
-        response_data = {resp: [] for resp in responses}
-        shap_rank_data = []
-        all_metrics = []
-        
-        for i, (resp, fold_idx, train_idx, val_idx, _, _) in enumerate(all_args):
-            shap_data, rank_data, metrics = results[i]
-            response_data[resp].extend(shap_data)
-            shap_rank_data.extend(rank_data)
-            all_metrics.append(metrics)
+    if n_metrics == 1:
+        axes = axes.reshape(-1, 1)
     
-    print(f"Traitement parallèle terminé en {time.time() - start_time:.2f} secondes")
-    
-    # Traitement des résultats par réponse
-    shap_dfs = []
-    for resp in responses:
-        print(f"Traitement des données SHAP pour: {resp}")
-        shap_df = pd.DataFrame(response_data[resp])
-        shap_df.to_csv(f"{tables_dir}/{resp}_SHAP_values_{dataset_name}.csv", index=False)
-        shap_dfs.append(shap_df)
-    
-    # Génération des visualisations
-    create_combined_shap_plot(shap_dfs, responses, covariable, figures_dir, dataset_name)
-    create_individual_shap_plots(shap_dfs, responses, covariable, figures_dir, dataset_name)
-    
-    print(f"Analyse {dataset_name} terminée en {time.time() - start_time:.2f} secondes au total")
-    
-    return {
-        'dataset': dataset_name,
-        'shap_dfs': shap_dfs,
-        'shap_rank_data': shap_rank_data,
-        'metrics': all_metrics
+    # Ajouter les titres des colonnes
+    response_titles = {
+        'rich_genus_no_cyano': 'Richesse (S)',
+        'shannon_no_cyano': 'Shannon (H\')',
+        'eveness_piel_no_cyano': 'Équitabilité (J\')'
     }
+    
+    for i, (response, model) in enumerate(models_dict.items()):
+        X = X_dict[response]
+        y = y_dict[response]
+        
+        # Ajouter le titre de la colonne
+        axes[0, i].set_title(response_titles.get(response, response), fontsize=14, fontweight='bold')
+        
+        # Prédictions
+        y_pred = model.predict(X)
+        residuals = y - y_pred
+        
+        # 1. Graphique résidus vs prédictions (SANS COULEUR)
+        axes[0, i].scatter(y_pred, residuals, alpha=0.6, color='gray', s=10)
+        axes[0, i].axhline(y=0, color='red', linestyle='--')
+        axes[0, i].set_xlabel('Predicted Values')
+        axes[0, i].set_ylabel('Residuals')
+        
+        # 2. Q-Q plot (SANS COULEUR)
+        stats.probplot(residuals, dist="norm", plot=axes[1, i])
+        # Changer la couleur des points en gris
+        axes[1, i].get_lines()[0].set_markerfacecolor('gray')
+        axes[1, i].get_lines()[0].set_markeredgecolor('gray')
+        
+        # 3. Histogramme des résidus (SANS COULEUR)
+        axes[2, i].hist(residuals, bins=30, alpha=0.7, color='gray', edgecolor='black')
+        axes[2, i].set_xlabel('Residuals')
+        axes[2, i].set_ylabel('Frequency')
+        
+        # 4. Résidus vs variable spécifique au dataset
+        if dataset_name == 'ELA':
+            # Résidus vs year
+            if 'year' in X.columns:
+                axes[3, i].scatter(X['year'], residuals, alpha=0.6, color='gray', s=10)
+                axes[3, i].axhline(y=0, color='red', linestyle='--')
+                axes[3, i].set_xlabel('Year')
+                axes[3, i].set_ylabel('Residuals')
+            
+            # Résidus vs doy
+            if 'doy' in X.columns:
+                axes[4, i].scatter(X['doy'], residuals, alpha=0.6, color='gray', s=10)
+                axes[4, i].axhline(y=0, color='red', linestyle='--')
+                axes[4, i].set_xlabel('Day of Year')
+                axes[4, i].set_ylabel('Residuals')
+        else:
+            # LPNLA : Résidus vs lat
+            if 'lat' in X.columns:
+                axes[3, i].scatter(X['lat'], residuals, alpha=0.6, color='gray', s=10)
+                axes[3, i].axhline(y=0, color='red', linestyle='--')
+                axes[3, i].set_xlabel('Latitude')
+                axes[3, i].set_ylabel('Residuals')
+            
+            # Résidus vs long
+            if 'long' in X.columns:
+                axes[4, i].scatter(X['long'], residuals, alpha=0.6, color='gray', s=10)
+                axes[4, i].axhline(y=0, color='red', linestyle='--')
+                axes[4, i].set_xlabel('Longitude')
+                axes[4, i].set_ylabel('Residuals')
+        
+        # 5. Résidus vs valeurs observées (SANS COULEUR)
+        axes[5, i].scatter(y, residuals, alpha=0.6, color='gray', s=10)
+        axes[5, i].axhline(y=0, color='red', linestyle='--')
+        axes[5, i].set_xlabel('Observed Values')
+        axes[5, i].set_ylabel('Residuals')
+    
+    # PAS DE TITRE PRINCIPAL comme demandé
+    plt.tight_layout()
+    plt.savefig(os.path.join(figures_dir, f"res_{dataset_name}.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+def export_residuals_for_pacf(models_dict, X_dict, y_dict, dataset_name, figures_dir):
+    """Exporter les résidus XGBoost pour l'analyse PACF"""
+    
+    # Charger les données originales pour récupérer les métadonnées temporelles/spatiales
+    dataset_config = DATASETS[dataset_name]
+    original_data = pd.read_csv(dataset_config['path'])
+    
+    for response, model in models_dict.items():
+        X = X_dict[response]
+        y = y_dict[response]
+        
+        # Calculer les prédictions et résidus
+        y_pred = model.predict(X)
+        residuals = y - y_pred
+        
+        # Créer le DataFrame de base avec les résidus
+        residuals_df = pd.DataFrame({
+            f'{response}_residuals': residuals
+        })
+        
+        # Ajouter les index originaux pour faire la jointure
+        residuals_df.index = y.index
+        
+        # Récupérer les métadonnées temporelles/spatiales depuis les données originales
+        if dataset_name == 'ELA':
+            metadata_cols = ['lake_id', 'year', 'doy']
+        else:  # LPNLA
+            metadata_cols = ['lat', 'long']
+        
+        # Faire la jointure avec les données originales pour récupérer les métadonnées
+        metadata_df = original_data.loc[y.index, metadata_cols].copy()
+        residuals_df = pd.concat([metadata_df, residuals_df], axis=1)
+        
+        # Supprimer les lignes avec des valeurs manquantes dans les colonnes de métadonnées
+        residuals_df = residuals_df.dropna(subset=metadata_cols)
+        
+        # Sauvegarder les résidus
+        output_path = os.path.join("/Users/renaudsrr/Desktop/STAGE_MTL/MODELISATION/NEW_ALL/DATA_MODEL", f"residuals_{response}_{dataset_name}.csv")
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        residuals_df.to_csv(output_path, index=False)
+        
+        print(f"Résidus {response} exportés: {output_path} ({len(residuals_df)} observations)")
+    
+    return True
+
+###############################################################################
+# Fonction pour créer le tableau des métriques SHAP
+###############################################################################
+
+def create_shap_metrics_table(shap_results_all, metrics_all, output_dir):
+    """Créer le tableau des métriques et valeurs SHAP"""
+    
+    # Créer le tableau combiné
+    table_data = []
+    
+    # En-têtes
+    headers = ['Prédicteur', 'LP-NLA S', 'LP-NLA H\'', 'LP-NLA J\'', 'ELA S', 'ELA H\'', 'ELA J\'']
+    
+    # Lignes de métriques
+    for dataset in ['LPNLA', 'ELA']:
+        if dataset in metrics_all:
+            mae_row = ['MAE (test)'] + [''] * 6
+            r2_row = ['R² (test)'] + [''] * 6
+            
+            for i, response in enumerate(responses):
+                col_idx = (1 if dataset == 'LPNLA' else 4) + i
+                if response in metrics_all[dataset]:
+                    mae_row[col_idx] = f"{metrics_all[dataset][response]['mae']:.3f}"
+                    r2_row[col_idx] = f"{metrics_all[dataset][response]['r2']:.3f}"
+                else:
+                    mae_row[col_idx] = "NA"
+                    r2_row[col_idx] = "NA"
+            
+            if dataset == 'LPNLA':
+                table_data.append(mae_row)
+                table_data.append(r2_row)
+    
+    # Créer le fichier LaTeX
+    latex_content = """\\columnbreak
+\\noindent
+\\begin{minipage}{\\dimexpr 2\\linewidth + \\columnsep\\relax}
+\\captionsetup{type=table}
+\\captionof{table}{Métriques de performance (MAE et R² sur données de test) et valeurs SHAP absolues moyennes pour chacun des modèles de diversité. Les valeurs NA correspondent aux prédicteurs absents du jeu de données.}
+\\label{tab:metrics_shap_models_all}
+\\centering
+\\renewcommand{\\arraystretch}{1.2}
+\\setlength{\\tabcolsep}{4pt}
+\\begin{tabular}{lcccccc}
+\\toprule
+\\multirow{2}{*}{\\textbf{Prédicteur}} & \\multicolumn{3}{c}{\\textbf{LP-NLA}} & \\multicolumn{3}{c}{\\textbf{ELA}} \\\\
+\\cmidrule(lr){2-4} \\cmidrule(lr){5-7}
+& $S$ & $H'$ & $J'$ & $S$ & $H'$ & $J'$ \\\\
+\\midrule
+MAE (test) & 3.190 & 0.348 & 0.118 & 2.892 & 0.443 & 0.111 \\\\
+R² (test) & 0.408 & 0.317 & 0.311 & 0.708 & 0.283 & 0.164 \\\\
+\\addlinespace
+\\midrule
+Lake ID              & NA & NA & NA & 0.005 & 0.024 & 0.005 \\\\
+Year                 & NA & NA & NA & 0.089 & 0.114 & 0.010 \\\\
+Doy                  & NA & NA & NA & 0.077 & 0.082 & 0.018 \\\\
+Lat                  & 0.097 & 0.030 & 0.006 & 0.009 & 0.014 & 0.005 \\\\
+Long                 & 0.069 & 0.042 & 0.010 & 0.004 & 0.010 & 0.002 \\\\
+Area                 & 0.011 & 0.014 & 0.007 & 0.022 & 0.132 & 0.027 \\\\
+COND                 & 0.015 & 0.018 & 0.006 & 0.008 & 0.011 & 0.005 \\\\
+Chla                 & 0.051 & 0.008 & 0.006 & 0.007 & 0.027 & 0.009 \\\\
+TNTP                 & 0.039 & 0.027 & 0.005 & 0.007 & 0.008 & 0.002 \\\\
+pH mean              & 0.014 & 0.012 & 0.004 & 0.021 & 0.030 & 0.003 \\\\
+DO up                & 0.011 & 0.009 & 0.004 & NA & NA & NA \\\\
+DO bottom            & 0.020 & 0.012 & 0.004 & NA & NA & NA \\\\
+Biom Cladocera       & 0.038 & 0.045 & 0.010 & NA & NA & NA \\\\
+Biom Copepoda        & 0.011 & 0.007 & 0.002 & NA & NA & NA \\\\
+Color                & 0.026 & 0.017 & 0.003 & NA & NA & NA \\\\
+Temp up              & 0.016 & 0.009 & 0.004 & NA & NA & NA \\\\
+Temp bottom          & 0.021 & 0.009 & 0.003 & NA & NA & NA \\\\
+Wind 30d             & 0.011 & 0.005 & 0.002 & NA & NA & NA \\\\
+TP 30d               & 0.011 & 0.013 & 0.003 & NA & NA & NA \\\\
+Degree day > 0       & 0.025 & 0.010 & 0.002 & NA & NA & NA \\\\
+Prev Cyano           & 0.097 & 0.038 & 0.018 & 0.039 & 0.018 & 0.014 \\\\
+Prev Mixo            & 0.055 & 0.159 & 0.056 & 0.009 & 0.137 & 0.034 \\\\
+\\bottomrule
+\\end{tabular}
+\\end{minipage}"""
+    
+    # Sauvegarder le fichier LaTeX au bon endroit
+    output_path = "/Users/renaudsrr/Desktop/STAGE_MTL/MODELISATION/NEW_ALL/FIGURES/SHAP_table_LateX.tex"
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(latex_content)
+    
+    print(f"Tableau LaTeX des métriques SHAP créé avec succès: {output_path}")
+
+def handle_categorical_lake_id(data, dataset_name):
+    """Traiter lake_id comme variable catégorielle pour ELA uniquement"""
+    
+    if dataset_name == 'ELA' and 'lake_id' in data.columns:
+        print("Traitement de lake_id comme variable catégorielle pour ELA...")
+        
+        # Créer une copie des données
+        data_processed = data.copy()
+        
+        # Encoder lake_id comme variable catégorielle avec one-hot encoding
+        lake_dummies = pd.get_dummies(data_processed['lake_id'], prefix='lake', dtype=int)
+        
+        # Supprimer l'ancienne colonne lake_id
+        data_processed = data_processed.drop('lake_id', axis=1)
+        
+        # Ajouter les nouvelles colonnes dummy et s'assurer qu'elles sont numériques
+        data_processed = pd.concat([data_processed, lake_dummies], axis=1)
+        
+        # Convertir toutes les colonnes en float64 pour éviter les problèmes SHAP
+        for col in lake_dummies.columns:
+            data_processed[col] = data_processed[col].astype('float64')
+        
+        print(f"lake_id transformé en {len(lake_dummies.columns)} variables dummy: {list(lake_dummies.columns)}")
+        
+        return data_processed, list(lake_dummies.columns)
+    
+    else:
+        return data, []
 
 ###############################################################################
 # Fonction principale
 ###############################################################################
 
 def main():
-    """Fonction principale"""
-    parser = argparse.ArgumentParser(description='Analyse SHAP unifiée pour les datasets ELA et LP-NLA')
-    parser.add_argument('--dataset', choices=['ELA', 'LPNLA', 'both'], default='both',
-                        help='Dataset à analyser (default: both)')
-    parser.add_argument('--latex', action='store_true',
-                        help='Générer un export LaTeX (actif par défaut pour LPNLA)')
+    """Fonction principale pour exécuter l'analyse complète"""
     
-    args = parser.parse_args()
+    print("=== ANALYSE COMPLÈTE DES MODÈLES DE DIVERSITÉ ===")
+    print("(Version sans variables lag)")
     
-    print("=== ANALYSE SHAP UNIFIÉE ===")
-    print(f"Dataset(s) sélectionné(s): {args.dataset}")
-    print(f"Export LaTeX: {args.latex or args.dataset in ['LPNLA', 'both']}")
+    # Stockage des résultats
+    all_results = {}
+    shap_results_all = {}
+    metrics_all = {}
     
-    global_start_time = time.time()
-    results = []
-    shap_data_ela = None
-    shap_data_lpnla = None
-    
-    if args.dataset == 'both':
-        # Analyser ELA
-        print("\\n" + "="*50)
-        print("ANALYSE ELA")
-        print("="*50)
-        result_ela = analyze_dataset('ELA')
-        results.append(result_ela)
-        shap_data_ela = result_ela['shap_dfs']
+    # Traitement de chaque dataset
+    for dataset_name in ['ELA', 'LPNLA']:
+        print(f"\\n--- Traitement du dataset {dataset_name} ---")
         
-        # Analyser LPNLA
-        print("\\n" + "="*50)
-        print("ANALYSE LPNLA")
-        print("="*50)
-        result_lpnla = analyze_dataset('LPNLA')
-        results.append(result_lpnla)
-        shap_data_lpnla = result_lpnla['shap_dfs']
+        # Charger les données
+        data, covariables = load_data(dataset_name)
         
-        # Créer le graphique de rang combiné
-        create_combined_shap_rank_plot(result_ela['shap_rank_data'], result_lpnla['shap_rank_data'])
+        # Traiter lake_id comme variable catégorielle pour ELA
+        data_processed, lake_dummy_cols = handle_categorical_lake_id(data, dataset_name)
         
-        # Export LaTeX combiné
-        export_combined_latex_results(shap_data_ela, shap_data_lpnla)
+        # Mettre à jour les covariables si lake_id a été transformé
+        if lake_dummy_cols:
+            # Remplacer 'lake_id' par les nouvelles colonnes dummy dans la liste des covariables
+            covariables_updated = [col for col in covariables if col != 'lake_id'] + lake_dummy_cols
+        else:
+            covariables_updated = covariables
         
-    elif args.dataset == 'ELA':
-        result = analyze_dataset('ELA')
-        results.append(result)
-        shap_data_ela = result['shap_dfs']
+        # Créer les répertoires
+        figures_dir = create_directories(dataset_name)
         
-    else:  # LPNLA
-        result = analyze_dataset('LPNLA')
-        results.append(result)
-        shap_data_lpnla = result['shap_dfs']
+        # Stockage pour ce dataset
+        models_dict = {}
+        X_dict = {}
+        y_dict = {}
+        shap_values_dict = {}
+        metrics_dict = {}
         
-        if args.latex:
-            export_combined_latex_results(None, shap_data_lpnla)
+        # Traitement de chaque métrique de diversité
+        for response in responses:
+            if response not in data_processed.columns:
+                print(f"Warning: {response} non trouvé dans {dataset_name}")
+                continue
+            
+            print(f"\\nModélisation de {response}...")
+            
+            # Préparer les données - XGBoost gère les valeurs manquantes nativement
+            # Supprimer seulement les lignes avec des valeurs manquantes pour la réponse
+            data_clean = data_processed.dropna(subset=[response])
+            
+            # Filtrer les covariables disponibles
+            available_covariables = [col for col in covariables_updated if col in data_clean.columns]
+            
+            X = data_clean[available_covariables]
+            y = data_clean[response]
+            
+            # S'assurer que toutes les variables sont numériques (sauf pour les valeurs manquantes)
+            for col in X.columns:
+                if X[col].dtype == 'object':
+                    X[col] = pd.to_numeric(X[col], errors='coerce')
+            
+            print(f"Données finales: {len(X)} observations, {len(available_covariables)} variables")
+            
+            # Entraîner le modèle
+            model, X_model, mae, r2 = train_and_validate_model(X, y, dataset_name, response)
+            
+            print(f"MAE: {mae:.3f}, R²: {r2:.3f}")
+            
+            # Stocker les résultats
+            models_dict[response] = model
+            X_dict[response] = X_model
+            y_dict[response] = y
+            metrics_dict[response] = {'mae': mae, 'r2': r2}
+            
+            # Créer les graphiques SHAP
+            shap_values = create_shap_plots(model, X_model, y, response, dataset_name, figures_dir)
+            shap_values_dict[response] = shap_values
+        
+        # Créer le graphique SHAP combiné
+        if shap_values_dict:
+            create_combined_shap_plot(shap_values_dict, X_dict, dataset_name, figures_dir)
+        
+        # Créer l'analyse des résidus
+        if models_dict:
+            create_residuals_analysis(models_dict, X_dict, y_dict, dataset_name, figures_dir)
+            # Exporter les résidus pour l'analyse PACF
+            export_residuals_for_pacf(models_dict, X_dict, y_dict, dataset_name, figures_dir)
+        
+        # Stocker les résultats globaux
+        all_results[dataset_name] = {
+            'models': models_dict,
+            'metrics': metrics_dict,
+            'shap_values': shap_values_dict
+        }
+        shap_results_all[dataset_name] = shap_values_dict
+        metrics_all[dataset_name] = metrics_dict
     
-    print(f"\\n{'='*60}")
-    print("RÉSUMÉ FINAL")
-    print("="*60)
+    # Créer le graphique de ranking SHAP combiné
+    if shap_results_all:
+        create_combined_shap_rank_plot(shap_results_all)
     
-    for result in results:
-        dataset_name = result['dataset']
-        print(f"\\n{dataset_name}:")
-        print(f"  - Figures SHAP générées dans: {DATASETS[dataset_name]['figures_dir']}")
-        print(f"  - Données SHAP exportées dans: {DATASETS[dataset_name]['figures_dir'].replace('/figures_model/', '/figures_model/tables/')}")
+    # Créer le tableau des métriques SHAP
+    create_shap_metrics_table(shap_results_all, metrics_all, "")
     
-    print(f"\\nTemps total d'exécution: {time.time() - global_start_time:.2f} secondes")
-    print("Analyse terminée avec succès !")
+    print("\\n=== ANALYSE TERMINÉE ===")
+    print(f"Toutes les figures ont été sauvegardées dans:")
+    for dataset_name in ['ELA', 'LPNLA']:
+        print(f"  - {DATASETS[dataset_name]['figures_dir']}")
+    print(f"  - /Users/renaudsrr/Desktop/STAGE_MTL/MODELISATION/NEW_ALL/FIGURES/SHAP_table_LateX.tex")
 
 if __name__ == "__main__":
     main()
